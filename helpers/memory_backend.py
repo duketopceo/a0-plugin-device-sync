@@ -1,0 +1,195 @@
+"""Memory-pack backend seam — replaces Khan's horde.memory coupling.
+
+Khan's continuity sync reads/writes ``horde.memory.store.MemoryAtomStore``
+directly. Stock a0 has no such store, so the plugin defines a minimal
+backend protocol — atoms are plain dicts with an ``id`` field — and a
+registry the host (or a sibling plugin like Kurultai) fills at configure
+time via ``runtime.register_memory_backend``.
+
+Shipped impls:
+
+- ``null`` (default) — memory sync reports "unsupported". A peer without
+  memory endpoints is a normal condition (Khan already treats a 404 as
+  skip-not-fail); with no backend this box IS that peer.
+- ``git`` — the MemFS-style option: ``memory_dir`` is a git repo of
+  ``<atom_id>.json`` files; ``import_atoms`` writes + commits; ``push``/
+  ``pull`` are real git ops. Backup/diff/rollback come free. ``git``
+  binary absence fails safe to an empty store.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import subprocess
+from pathlib import Path
+from typing import Any, Protocol
+
+from usr.plugins.device_sync.helpers import LOG_NAME
+
+log = logging.getLogger(LOG_NAME)
+
+
+class MemoryBackend(Protocol):
+    """The contract the sync engine calls. All methods are failure-contained
+    in the engine — impls may raise; callers catch."""
+
+    def export_atoms(self) -> list[dict[str, Any]]:
+        """All syncable atoms (expired/atoms the impl wants skipped are
+        its own business — the transport ships what it gets)."""
+        ...
+
+    def has_atom(self, atom_id: str) -> bool:
+        """True when the atom already exists locally — import is
+        idempotent by id, supersession is the atom's own job."""
+        ...
+
+    def import_atoms(self, atoms: list[dict[str, Any]]) -> int:
+        """Store atoms that are new; return count actually imported."""
+        ...
+
+
+class NullMemoryBackend:
+    """Default — no memory store. Export returns [], import returns 0."""
+
+    def export_atoms(self) -> list[dict[str, Any]]:
+        return []
+
+    def has_atom(self, atom_id: str) -> bool:
+        return False
+
+    def import_atoms(self, atoms: list[dict[str, Any]]) -> int:
+        return 0
+
+
+class GitMemoryBackend:
+    """Atom store = a git repo of JSON files. Import writes files and
+    commits; push/pull run the real git ops. Falls back to an empty store
+    when git or the repo is unavailable — never raises out of sync paths."""
+
+    def __init__(self, repo_dir: str | Path) -> None:
+        self.dir = Path(repo_dir)
+        self._git = self._find_git()
+
+    @staticmethod
+    def _find_git() -> str | None:
+        import shutil
+
+        return shutil.which("git")
+
+    @property
+    def available(self) -> bool:
+        return self._git is not None and self.dir.is_dir()
+
+    def _atom_path(self, atom_id: str) -> Path:
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in atom_id)
+        return self.dir / f"{safe or 'atom'}.json"
+
+    def _run_git(self, *args: str, timeout: float = 60) -> bool:
+        if not self.available:
+            return False
+        try:
+            proc = subprocess.run(
+                [self._git, "-C", str(self.dir), *args],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+            return proc.returncode == 0
+        except Exception as e:
+            log.warning("device-sync git backend: git %s failed: %s", args[0], e)
+            return False
+
+    def export_atoms(self) -> list[dict[str, Any]]:
+        if not self.dir.is_dir():
+            return []
+        atoms: list[dict[str, Any]] = []
+        for path in sorted(self.dir.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(data, dict) and data.get("id"):
+                atoms.append(data)
+        return atoms
+
+    def has_atom(self, atom_id: str) -> bool:
+        return self._atom_path(str(atom_id)).is_file()
+
+    def import_atoms(self, atoms: list[dict[str, Any]]) -> int:
+        imported = 0
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log.warning("device-sync git backend: mkdir %s failed: %s", self.dir, e)
+            return 0
+        for atom in atoms:
+            atom_id = str(atom.get("id") or "").strip()
+            if not atom_id or self.has_atom(atom_id):
+                continue
+            try:
+                self._atom_path(atom_id).write_text(
+                    json.dumps(atom, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as e:
+                log.warning("device-sync git backend: write %s failed: %s", atom_id, e)
+                continue
+            imported += 1
+        if imported and self.available:
+            self._run_git("add", "-A", ".")
+            self._run_git(
+                "-c", "user.name=a0-device-sync",
+                "-c", "user.email=device-sync@local",
+                "commit", "-q", "-m", f"device-sync import: {imported} atoms",
+            )
+        return imported
+
+    # MemFS extras — the transport doesn't call these; operators/other
+    # plugins can (rollback = `git revert`, backup = the remote).
+    def pull(self) -> bool:
+        return self._run_git("pull", "--ff-only")
+
+    def push(self) -> bool:
+        return self._run_git("push")
+
+
+# Backend registry — populated by runtime.configure from the
+# `memory_backend` config key; sibling plugins can register richer stores.
+_factories: dict[str, Any] = {}
+
+
+def register_backend(name: str, factory) -> None:
+    """Register a backend factory ``(config: dict) -> MemoryBackend``."""
+    if name and callable(factory):
+        _factories[str(name)] = factory
+
+
+def make_backend(name: str, config: dict[str, Any]) -> MemoryBackend:
+    """Resolve a backend by name; unknown/absent -> null (never raises)."""
+    name = (name or "none").strip().lower()
+    if name in ("none", "null", "off", ""):
+        return NullMemoryBackend()
+    try:
+        if name == "git":
+            return GitMemoryBackend(config.get("memory_dir") or _default_dir())
+        factory = _factories.get(name)
+        if factory is not None:
+            backend = factory(config)
+            if backend is not None:
+                return backend
+    except Exception as e:
+        log.warning("device-sync memory backend %r failed: %s", name, e)
+    return NullMemoryBackend()
+
+
+def _default_dir() -> str:
+    try:
+        from helpers import files
+
+        return str(files.get_abs_path("usr/plugins/device_sync/data/memory-atoms"))
+    except Exception:
+        return str(Path.home() / ".a0-device-sync" / "memory-atoms")
+
+
+def reset_backends() -> None:
+    """Clear custom registrations (test/uninstall hook)."""
+    _factories.clear()
