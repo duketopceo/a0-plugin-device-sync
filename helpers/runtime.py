@@ -22,9 +22,10 @@ _cfg = None  # SyncConfig | None
 _lock = threading.Lock()
 
 
-def configure(config: dict[str, Any]) -> Any:
-    """Build/rebuild the sync engine from a raw config dict. Returns the
-    ContinuitySync, or None when disabled. Safe to call repeatedly."""
+def configure(config: dict[str, Any] | None = None) -> Any:
+    """Build/rebuild the sync engine from a raw config dict (None = host
+    lookup via get_plugin_config). Returns the ContinuitySync, or None when
+    disabled. Safe to call repeatedly."""
     global _sync, _cfg
     from usr.plugins.device_sync.helpers import memory_backend
     from usr.plugins.device_sync.helpers.config import get_config
@@ -45,7 +46,9 @@ def configure(config: dict[str, Any]) -> Any:
         log.info("device-sync: disabled")
         return None
 
-    backend = memory_backend.make_backend(cfg.memory_backend, {"memory_dir": cfg.memory_dir})
+    backend = memory_backend.make_backend(
+        cfg.memory_backend, {**cfg.to_dict(), "memory_dir": cfg.memory_dir}
+    )
     sync = ContinuitySync(
         backend=backend,
         peers_file=cfg.peers_file or None,
@@ -79,10 +82,12 @@ def engine() -> Any:
 
 
 def token_ok(token: str | None) -> bool:
-    """Constant-ish token check for API handlers. No token configured ->
+    """Constant-time token check for API handlers. No token configured ->
     refuse everything (secure default)."""
+    import secrets
+
     configured = _cfg.sync_token if _cfg else ""
-    return bool(configured) and token == configured
+    return bool(configured) and secrets.compare_digest(token or "", configured)
 
 
 def sync_now(peer: str | None = None, direction: str = "bidirectional") -> dict[str, Any]:
@@ -94,17 +99,32 @@ def sync_now(peer: str | None = None, direction: str = "bidirectional") -> dict[
         return {"ok": False, "error": f"unknown direction {direction!r}"}
 
     try:
-        targets = [sync._peer_by_name(peer)] if peer else sync.discover_peers()
+        targets = [sync.peer_by_name(peer)] if peer else sync.discover_peers()
         targets = [t for t in targets if t is not None]
         if peer and not targets:
             return {"ok": False, "error": f"peer {peer!r} not found/unreachable"}
         if not targets:
             return {"ok": True, "results": [], "note": "no peers discovered"}
 
+        # Push packs are byte-identical across peers — build once when
+        # pushing to several. (bidirectional rebuilds settings per peer by
+        # design: the pack doubles as the pre-pull conflict snapshot.)
+        prebuilt: dict[str, Any] = {}
+        if direction == "push":
+            from usr.plugins.device_sync.helpers import packs
+
+            try:
+                prebuilt["settings_pack"] = packs.build_settings_pack()
+                prebuilt["chats_zip"], _ = packs.build_chats_zip_bytes()
+                prebuilt["memory_ndjson"] = sync.export_memory_pack()
+            except Exception as e:
+                log.warning("device-sync: prebuild failed, peers build own packs: %s", e)
+                prebuilt = {}
+
         results = []
         for p in targets:
             if direction == "push":
-                r = sync.sync_to_peer(p)
+                r = sync.sync_to_peer(p, **prebuilt)
             elif direction == "pull":
                 r = sync.sync_from_peer(p)
             else:
@@ -136,9 +156,10 @@ def peers() -> list[dict[str, Any]]:
     if sync is None:
         return []
     try:
+        from dataclasses import asdict
+
         return [
-            {"name": p.name, "host": p.host, "port": p.port,
-             "last_sync": p.last_sync, "last_sync_status": p.last_sync_status}
+            {k: v for k, v in asdict(p).items() if k != "ts_hostname"}
             for p in sync.discover_peers()
         ]
     except Exception as e:

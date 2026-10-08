@@ -11,40 +11,33 @@ inbox when the pack carries it.
 
 from __future__ import annotations
 
+import os
+
 from helpers.api import ApiHandler
 
+from usr.plugins.device_sync.helpers.auth import PeerEndpoint
 
-class ChatsImport(ApiHandler):
-    @classmethod
-    def get_methods(cls):
-        return ["POST"]
 
-    @classmethod
-    def requires_auth(cls):
-        return False  # bearer-token gated in process()
-
-    @classmethod
-    def requires_csrf(cls):
-        return False  # machine-to-machine; no ambient credential
-
+class ChatsImport(PeerEndpoint, ApiHandler):
     async def process(self, input, request):
         from usr.plugins.device_sync.helpers import auth, packs
 
-        denial = auth.check_peer_request(request)
+        denial = self.deny(request)
         if denial is not None:
             return denial
         raw = request.get_data()
         try:
-            manifest, chat_jsons, ndjson = packs.extract_chats_from_zip(raw)
+            _manifest, chat_jsons, ndjson = packs.extract_chats_from_zip(raw)
             ctxids = packs.import_chat_jsons(chat_jsons)
-            inbox_path = None
+            inbox_name = None
             if ndjson.strip():
                 inbox_path = packs.write_kurultai_ndjson(ndjson)
+                inbox_name = os.path.basename(inbox_path)  # never echo abs paths
             return {
                 "ok": True,
                 "ctxids": ctxids,
                 "chats": len(chat_jsons),
-                "inbox": inbox_path,
+                "inbox": inbox_name,
             }
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": auth.safe_error(e)}

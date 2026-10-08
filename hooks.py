@@ -13,12 +13,9 @@ import logging
 
 
 def install() -> None:
-    try:
-        logging.getLogger("a0.device_sync").info(
-            "device-sync plugin installed — engine configures at startup_migration"
-        )
-    except Exception:
-        pass
+    logging.getLogger("a0.device_sync").info(
+        "device-sync plugin installed — engine configures at startup_migration"
+    )
 
 
 def uninstall() -> None:
@@ -29,4 +26,6 @@ def uninstall() -> None:
         runtime._reset()
         memory_backend.reset_backends()
     except Exception:
-        pass
+        logging.getLogger("a0.device_sync").exception(
+            "device-sync uninstall cleanup failed"
+        )

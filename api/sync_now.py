@@ -11,24 +11,14 @@ from __future__ import annotations
 
 from helpers.api import ApiHandler
 
+from usr.plugins.device_sync.helpers.auth import PeerEndpoint
 
-class SyncNow(ApiHandler):
-    @classmethod
-    def get_methods(cls):
-        return ["POST"]
 
-    @classmethod
-    def requires_auth(cls):
-        return False  # bearer-token gated in process()
-
-    @classmethod
-    def requires_csrf(cls):
-        return False  # machine-to-machine; no ambient credential
-
+class SyncNow(PeerEndpoint, ApiHandler):
     async def process(self, input, request):
-        from usr.plugins.device_sync.helpers import auth, runtime
+        from usr.plugins.device_sync.helpers import runtime
 
-        denial = auth.check_peer_request(request)
+        denial = self.deny(request)
         if denial is not None:
             return denial
         input = input if isinstance(input, dict) else {}

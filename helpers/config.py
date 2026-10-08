@@ -9,8 +9,9 @@ Never raises out of callers — validation errors clamp to safe defaults.
 from __future__ import annotations
 
 import logging
+import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from usr.plugins.device_sync.helpers import LOG_NAME
@@ -77,7 +78,7 @@ def _as_float(value: Any, default: float, *, minimum: float = 0.0) -> float:
         out = float(value)
     except (TypeError, ValueError):
         return default
-    if out != out or out in (float("inf"), float("-inf")):  # NaN/inf guard
+    if not math.isfinite(out):
         return default
     return max(minimum, out)
 
@@ -111,8 +112,8 @@ def _parse(raw: dict[str, Any]) -> SyncConfig:
 
 def get_config(config: dict[str, Any] | None = None) -> SyncConfig:
     """Return validated config. ``config`` overrides the host lookup."""
+    raw: dict[str, Any] = config if isinstance(config, dict) else {}
     if config is None:
-        raw: dict[str, Any] = {}
         try:
             from helpers.plugins import get_plugin_config
 
@@ -123,5 +124,4 @@ def get_config(config: dict[str, Any] | None = None) -> SyncConfig:
             pass  # standalone/test context — defaults + env
         except Exception as e:
             log.warning("device-sync: get_plugin_config failed, using defaults: %s", e)
-        return _parse(_merge_env(raw))
-    return _parse(_merge_env(config if isinstance(config, dict) else {}))
+    return _parse(_merge_env(raw))

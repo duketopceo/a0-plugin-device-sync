@@ -83,6 +83,12 @@ class GitMemoryBackend:
 
     def _atom_path(self, atom_id: str) -> Path:
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in atom_id)
+        if safe != atom_id:
+            # ids differing only in stripped chars must not collide — a
+            # short content hash keeps the mapping injective.
+            import hashlib
+
+            safe = f"{safe or 'atom'}-{hashlib.blake2s(atom_id.encode(), digest_size=6).hexdigest()}"
         return self.dir / f"{safe or 'atom'}.json"
 
     def _run_git(self, *args: str, timeout: float = 60) -> bool:
@@ -105,7 +111,12 @@ class GitMemoryBackend:
         for path in sorted(self.dir.glob("*.json")):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as e:
+                log.warning(
+                    "device-sync git backend: skipping unreadable atom file %s: %s",
+                    path,
+                    e,
+                )
                 continue
             if isinstance(data, dict) and data.get("id"):
                 atoms.append(data)

@@ -50,7 +50,7 @@ helpers/runtime.py        facade: configure/stop/sync_now/status,
                           memory-backend registry
 api/                      8 handlers: settings_export/import,
                           chats_export/import, memory_export/import,
-                          sync_status, sync_now, peers
+                          sync_now, peers (status folded into peers)
 extensions/python/startup_migration/_70_device_sync_init.py  configure+start
 hooks.py                  install log-only; uninstall stops the loop thread
 ```

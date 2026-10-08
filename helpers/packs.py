@@ -25,7 +25,6 @@ import io
 import json
 import os
 import tempfile
-import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,7 +33,8 @@ from typing import Any
 SETTINGS_PACK_VERSION = 1
 CHATS_PACK_VERSION = 1
 MEMORY_PACK_VERSION = 1
-MEMORY_PACK_FORMAT = "khan-memory"
+SETTINGS_PACK_FORMAT = "khan-settings"
+CHATS_PACK_FORMAT = "khan-chats"
 KURULTAI_INBOX_REL = "usr/kurultai-inbox/chats"
 
 # Keys that never leave the box and are never overwritten by an import.
@@ -78,7 +78,7 @@ def build_settings_pack() -> dict[str, Any]:
     current = settings.get_settings()
     prefs = strip_sensitive_settings(dict(current))
     return {
-        "format": "khan-settings",
+        "format": SETTINGS_PACK_FORMAT,
         "version": SETTINGS_PACK_VERSION,
         "exported_at": _utc_now_iso(),
         "settings": prefs,
@@ -91,7 +91,7 @@ def import_settings_pack(pack: dict[str, Any]) -> Any:
 
     if not isinstance(pack, dict):
         raise ValueError("Settings pack must be a JSON object")
-    if pack.get("format") != "khan-settings":
+    if pack.get("format") != SETTINGS_PACK_FORMAT:
         raise ValueError(f"Unsupported settings pack format: {pack.get('format')!r}")
     if "version" not in pack:
         raise ValueError("Settings pack missing version")
@@ -102,9 +102,7 @@ def import_settings_pack(pack: dict[str, Any]) -> Any:
         raise ValueError("Settings pack missing 'settings' object")
 
     current = settings.get_settings()
-    overlay = strip_sensitive_settings(dict(incoming))
-    for key in SENSITIVE_SETTINGS_KEYS:
-        overlay.pop(key, None)
+    overlay = {k: v for k, v in incoming.items() if k not in SENSITIVE_SETTINGS_KEYS}
 
     merged = {**current, **overlay}
     for key in SENSITIVE_SETTINGS_KEYS:
@@ -222,7 +220,7 @@ def build_chats_zip_bytes(ctxids: list[str] | None = None) -> tuple[bytes, dict[
     chat_jsons = [js for _, js in pairs]
     ndjson = build_chats_ndjson(chat_jsons)
     manifest = {
-        "format": "khan-chats",
+        "format": CHATS_PACK_FORMAT,
         "version": CHATS_PACK_VERSION,
         "exported_at": _utc_now_iso(),
         "chat_count": len(pairs),
@@ -253,10 +251,10 @@ def build_memory_pack(atoms: list[dict[str, Any]]) -> bytes:
 
 def iter_memory_pack(ndjson_data: bytes):
     """Yield atom dicts from an NDJSON memory pack. Raises ValueError on a
-    malformed line (line-numbered, like the kurultai validator)."""
-    text = ndjson_data.decode("utf-8", errors="replace")
-    for line_no, raw in enumerate(text.splitlines(), start=1):
-        line = raw.strip()
+    malformed line (line-numbered, like the kurultai validator). Streams
+    one line at a time — a 50MB pack never triples in memory."""
+    for line_no, raw_bytes in enumerate(io.BytesIO(ndjson_data), start=1):
+        line = raw_bytes.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         try:
@@ -287,13 +285,16 @@ def _assert_zip_bounds(zf: zipfile.ZipFile) -> None:
                 f"{info.file_size} exceeds {MAX_ZIP_ENTRY_UNCOMPRESSED}"
             )
         total_uncompressed += info.file_size
-        if info.compress_size > 0:
-            ratio = info.file_size / info.compress_size
-            if ratio > MAX_ZIP_COMPRESSION_RATIO and info.file_size > 1024 * 1024:
-                raise ValueError(
-                    f"ZIP entry {info.filename!r} compression ratio {ratio:.1f} "
-                    f"exceeds {MAX_ZIP_COMPRESSION_RATIO}"
-                )
+        if (
+            info.compress_size > 0
+            and info.file_size > 1024 * 1024
+            and info.file_size / info.compress_size > MAX_ZIP_COMPRESSION_RATIO
+        ):
+            raise ValueError(
+                f"ZIP entry {info.filename!r} compression ratio "
+                f"{info.file_size / info.compress_size:.1f} exceeds "
+                f"{MAX_ZIP_COMPRESSION_RATIO}"
+            )
     if total_uncompressed > MAX_ZIP_TOTAL_UNCOMPRESSED:
         raise ValueError(
             f"ZIP total uncompressed size {total_uncompressed} exceeds "
@@ -319,7 +320,7 @@ def extract_chats_from_zip(zip_bytes: bytes) -> tuple[dict[str, Any], list[str],
 
         chat_jsons: list[str] = []
         for name in sorted(names):
-            if name.startswith("chats/") and name.endswith(".json") and not name.endswith("/"):
+            if name.startswith("chats/") and name.endswith(".json"):
                 chat_jsons.append(zf.read(name).decode("utf-8"))
 
         declared = manifest.get("chat_count")
@@ -357,7 +358,8 @@ def kurultai_inbox_dir() -> str:
 
 def write_kurultai_ndjson(ndjson: str, filename: str | None = None) -> str:
     """Atomically drop a validated NDJSON file into the kurultai inbox —
-    the json-connector indexing path. 0600, O_EXCL, unique-suffixed."""
+    the json-connector indexing path. mkstemp gives 0600 + O_EXCL-unique
+    names; nothing else links the file, so no retry loop is needed."""
     validate_kurultai_ndjson(ndjson)
     inbox = kurultai_inbox_dir()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -365,26 +367,18 @@ def write_kurultai_ndjson(ndjson: str, filename: str | None = None) -> str:
     prefix = Path(prefix).stem
     prefix = "".join(c if c.isalnum() or c in "-_" else "_" for c in prefix) or "khan-chats"
 
-    payload = ndjson if ndjson.endswith("\n") or not ndjson else ndjson + "\n"
-    for _ in range(8):
-        name = f"{prefix}-{uuid.uuid4().hex[:8]}.ndjson"
-        dest = os.path.join(inbox, name)
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    payload = ndjson if ndjson.endswith("\n") else ndjson + "\n"
+    fd, dest = tempfile.mkstemp(dir=inbox, prefix=f"{prefix}-", suffix=".ndjson")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+    except Exception:
         try:
-            fd = os.open(dest, flags, 0o600)
-        except FileExistsError:
-            continue
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-        except Exception:
-            try:
-                os.unlink(dest)
-            except OSError:
-                pass
-            raise
-        return dest
-    raise RuntimeError("Could not allocate unique kurultai inbox filename")
+            os.unlink(dest)
+        except OSError:
+            pass
+        raise
+    return dest
 
 
 def write_temp_file(content: bytes, suffix: str) -> str:
@@ -397,8 +391,35 @@ def write_temp_file(content: bytes, suffix: str) -> str:
             os.close(fd)
         except OSError:
             pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
         raise
     return path
+
+
+def build_chats_zip_file(path: str, ctxids: list[str] | None = None) -> dict[str, Any]:
+    """Stream the chats pack ZIP straight to a temp file — avoids holding
+    the full archive in memory alongside every chat JSON."""
+    pairs = collect_exportable_chat_jsons(ctxids)
+    chat_jsons = [js for _, js in pairs]
+    ndjson = build_chats_ndjson(chat_jsons)
+    manifest = {
+        "format": CHATS_PACK_FORMAT,
+        "version": CHATS_PACK_VERSION,
+        "exported_at": _utc_now_iso(),
+        "chat_count": len(pairs),
+        "chat_ids": [cid for cid, _ in pairs],
+        "kurultai_atoms": ndjson.count("\n") if ndjson else 0,
+    }
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+        for ctxid, js in pairs:
+            safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in ctxid)
+            zf.writestr(f"chats/{safe}.json", js)
+        zf.writestr("kurultai/chats.ndjson", ndjson)
+    return manifest
 
 
 def send_temp_file(
@@ -419,16 +440,14 @@ def send_temp_file(
         )
     except Exception:
         try:
-            if os.path.exists(path):
-                os.unlink(path)
+            os.unlink(path)
         except OSError:
             pass
         raise
 
     def _cleanup() -> None:
         try:
-            if os.path.exists(path):
-                os.unlink(path)
+            os.unlink(path)
         except OSError:
             pass
 

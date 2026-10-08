@@ -317,8 +317,7 @@ def test_iter_memory_pack_rejects_malformed():
         list(packs.iter_memory_pack(b'{"id":"ok"}\n{bad}\n'))
 
 
-def test_send_temp_file_cleans_up(tmp_path, monkeypatch):
-    calls = []
+def test_send_temp_file_cleans_up():
     p = packs.write_temp_file(b"zip", ".zip")
     resp = packs.send_temp_file(p, download_name="x.zip", mimetype="application/zip")
     assert resp.get_data() == b"zip"

@@ -1,32 +1,23 @@
 """Peer discovery + engine status.
 
 POST /api/plugins/device_sync/peers — body: {}
-Runs discovery (Tailscale status probe + manual peers file) and returns
-the live peer list with per-peer last-sync bookkeeping plus engine status.
+Returns the peer list (TTL-cached discovery) with per-peer last-sync
+bookkeeping plus engine status. "peers" is the fresh discovered view;
+"status.peers" is the engine's cached map — same data, different window.
 """
 
 from __future__ import annotations
 
 from helpers.api import ApiHandler
 
+from usr.plugins.device_sync.helpers.auth import PeerEndpoint
 
-class Peers(ApiHandler):
-    @classmethod
-    def get_methods(cls):
-        return ["POST"]
 
-    @classmethod
-    def requires_auth(cls):
-        return False  # bearer-token gated in process()
-
-    @classmethod
-    def requires_csrf(cls):
-        return False  # machine-to-machine; no ambient credential
-
+class Peers(PeerEndpoint, ApiHandler):
     async def process(self, input, request):
-        from usr.plugins.device_sync.helpers import auth, runtime
+        from usr.plugins.device_sync.helpers import runtime
 
-        denial = auth.check_peer_request(request)
+        denial = self.deny(request)
         if denial is not None:
             return denial
         return {"ok": True, "peers": runtime.peers(), "status": runtime.status()}

@@ -24,4 +24,8 @@ class DeviceSyncInit(Extension):
 
             runtime.configure(None)
         except Exception:
-            pass
+            import logging
+
+            logging.getLogger("a0.device_sync").exception(
+                "device-sync configure failed — plugin inactive"
+            )

@@ -10,24 +10,14 @@ from __future__ import annotations
 
 from helpers.api import ApiHandler
 
+from usr.plugins.device_sync.helpers.auth import PeerEndpoint
 
-class MemoryImport(ApiHandler):
-    @classmethod
-    def get_methods(cls):
-        return ["POST"]
 
-    @classmethod
-    def requires_auth(cls):
-        return False  # bearer-token gated in process()
-
-    @classmethod
-    def requires_csrf(cls):
-        return False  # machine-to-machine; no ambient credential
-
+class MemoryImport(PeerEndpoint, ApiHandler):
     async def process(self, input, request):
         from usr.plugins.device_sync.helpers import auth, packs, runtime
 
-        denial = auth.check_peer_request(request)
+        denial = self.deny(request)
         if denial is not None:
             return denial
         sync = runtime.engine()
@@ -39,4 +29,4 @@ class MemoryImport(ApiHandler):
             imported = sync.import_memory_pack(raw)
             return {"ok": True, "imported": imported}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": auth.safe_error(e)}

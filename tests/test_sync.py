@@ -131,7 +131,7 @@ def test_memory_endpoints_404_are_graceful(tmp_path, settings_state):
 
 
 def test_unreachable_peer_degrades_to_errors(tmp_path):
-    sync = _mk_sync(tmp_path)
+    sync = _mk_sync(tmp_path, backend=DictMemoryBackend([{"id": "a1"}]))
 
     def boom(url, **kw):
         raise OSError("connection refused")

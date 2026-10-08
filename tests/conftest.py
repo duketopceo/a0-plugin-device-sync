@@ -261,9 +261,8 @@ def chats_store():
 
 @pytest.fixture()
 def files_root(tmp_path, monkeypatch):
-    _files_mod.get_abs_path = lambda rel: str(tmp_path / rel)
-    yield tmp_path
-    _files_mod.get_abs_path = _get_abs_path
+    monkeypatch.setattr(_files_mod, "get_abs_path", lambda rel: str(tmp_path / rel))
+    return tmp_path
 
 
 @pytest.fixture()
