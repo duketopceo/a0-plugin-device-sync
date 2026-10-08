@@ -19,9 +19,14 @@ Shipped impls:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
+import shutil
 import subprocess
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -31,8 +36,12 @@ log = logging.getLogger(LOG_NAME)
 
 
 class MemoryBackend(Protocol):
-    """The contract the sync engine calls. All methods are failure-contained
-    in the engine — impls may raise; callers catch."""
+    """The contract the sync engine calls — it only ever invokes
+    ``export_atoms``/``import_atoms`` (+ reads ``is_null``). Impls may
+    raise; the engine failure-contains. ``has_atom`` is an impl-internal
+    dedupe helper, not an engine-facing method."""
+
+    is_null: bool = False  # True = "no memory store" — pull skips fetching
 
     def export_atoms(self) -> list[dict[str, Any]]:
         """All syncable atoms (expired/atoms the impl wants skipped are
@@ -52,6 +61,8 @@ class MemoryBackend(Protocol):
 class NullMemoryBackend:
     """Default — no memory store. Export returns [], import returns 0."""
 
+    is_null = True
+
     def export_atoms(self) -> list[dict[str, Any]]:
         return []
 
@@ -67,14 +78,18 @@ class GitMemoryBackend:
     commits; push/pull run the real git ops. Falls back to an empty store
     when git or the repo is unavailable — never raises out of sync paths."""
 
+    is_null = False
+
     def __init__(self, repo_dir: str | Path) -> None:
         self.dir = Path(repo_dir)
         self._git = self._find_git()
+        # import_atoms runs from both the sync engine and the memory_import
+        # API handler — serialize so concurrent imports can't tear files
+        # or race git's index.lock.
+        self._import_lock = threading.Lock()
 
     @staticmethod
     def _find_git() -> str | None:
-        import shutil
-
         return shutil.which("git")
 
     @property
@@ -86,8 +101,6 @@ class GitMemoryBackend:
         if safe != atom_id:
             # ids differing only in stripped chars must not collide — a
             # short content hash keeps the mapping injective.
-            import hashlib
-
             safe = f"{safe or 'atom'}-{hashlib.blake2s(atom_id.encode(), digest_size=6).hexdigest()}"
         return self.dir / f"{safe or 'atom'}.json"
 
@@ -99,7 +112,13 @@ class GitMemoryBackend:
                 [self._git, "-C", str(self.dir), *args],
                 capture_output=True, text=True, timeout=timeout, check=False,
             )
-            return proc.returncode == 0
+            if proc.returncode != 0:
+                log.warning(
+                    "device-sync git backend: git %s exited %s: %s",
+                    args[0], proc.returncode, (proc.stderr or "").strip()[:300],
+                )
+                return False
+            return True
         except Exception as e:
             log.warning("device-sync git backend: git %s failed: %s", args[0], e)
             return False
@@ -125,33 +144,48 @@ class GitMemoryBackend:
     def has_atom(self, atom_id: str) -> bool:
         return self._atom_path(str(atom_id)).is_file()
 
+    def _write_atom(self, atom: dict[str, Any], path: Path) -> None:
+        """tmp + os.replace — a crash mid-write must not leave a corrupt
+        file that has_atom then treats as present forever."""
+        fd, tmp = tempfile.mkstemp(dir=str(self.dir), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(atom, ensure_ascii=False, indent=2) + "\n")
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
     def import_atoms(self, atoms: list[dict[str, Any]]) -> int:
         imported = 0
-        try:
-            self.dir.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            log.warning("device-sync git backend: mkdir %s failed: %s", self.dir, e)
-            return 0
-        for atom in atoms:
-            atom_id = str(atom.get("id") or "").strip()
-            if not atom_id or self.has_atom(atom_id):
-                continue
+        with self._import_lock:
             try:
-                self._atom_path(atom_id).write_text(
-                    json.dumps(atom, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
+                self.dir.mkdir(parents=True, exist_ok=True)
             except OSError as e:
-                log.warning("device-sync git backend: write %s failed: %s", atom_id, e)
-                continue
-            imported += 1
-        if imported and self.available:
-            self._run_git("add", "-A", ".")
-            self._run_git(
-                "-c", "user.name=a0-device-sync",
-                "-c", "user.email=device-sync@local",
-                "commit", "-q", "-m", f"device-sync import: {imported} atoms",
-            )
+                log.warning("device-sync git backend: mkdir %s failed: %s", self.dir, e)
+                return 0
+            for atom in atoms:
+                atom_id = str(atom.get("id") or "").strip()
+                if not atom_id or self.has_atom(atom_id):
+                    continue
+                try:
+                    self._write_atom(atom, self._atom_path(atom_id))
+                except OSError as e:
+                    log.warning(
+                        "device-sync git backend: write %r failed: %s", atom_id, e
+                    )
+                    continue
+                imported += 1
+            if imported and self.available:
+                self._run_git("add", "-A", ".")
+                self._run_git(
+                    "-c", "user.name=a0-device-sync",
+                    "-c", "user.email=device-sync@local",
+                    "commit", "-q", "-m", f"device-sync import: {imported} atoms",
+                )
         return imported
 
     # MemFS extras — the transport doesn't call these; operators/other

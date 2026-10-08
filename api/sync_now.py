@@ -9,6 +9,8 @@ request failure.
 
 from __future__ import annotations
 
+import asyncio
+
 from helpers.api import ApiHandler
 
 from usr.plugins.device_sync.helpers.auth import PeerEndpoint
@@ -22,7 +24,10 @@ class SyncNow(PeerEndpoint, ApiHandler):
         if denial is not None:
             return denial
         input = input if isinstance(input, dict) else {}
-        return runtime.sync_now(
+        # sync does blocking urllib work (seconds-to-minutes per peer) —
+        # run it off the host's request loop.
+        return await asyncio.to_thread(
+            runtime.sync_now,
             peer=input.get("peer") or None,
             direction=input.get("direction") or "bidirectional",
         )

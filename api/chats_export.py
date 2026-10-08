@@ -10,6 +10,7 @@ ctxid.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 
@@ -26,13 +27,16 @@ class ChatsExport(PeerEndpoint, ApiHandler):
         if denial is not None:
             return denial
         ctxids = input.get("ctxids") if isinstance(input, dict) else None
-        if ctxids is not None and not isinstance(ctxids, list):
-            return {"ok": False, "error": "ctxids must be a list"}
+        if ctxids is not None and (
+            not isinstance(ctxids, list)
+            or not all(isinstance(c, str) for c in ctxids)
+        ):
+            return {"ok": False, "error": "ctxids must be a list of strings"}
         path = None
         try:
             fd, path = tempfile.mkstemp(suffix=".zip")
             os.close(fd)
-            manifest = packs.build_chats_zip_file(path, ctxids)
+            manifest = await asyncio.to_thread(packs.build_chats_zip_file, path, ctxids)
             return packs.send_temp_file(
                 path,
                 download_name=f"chats-{manifest['chat_count']}.zip",

@@ -21,6 +21,7 @@ abort a0's plugin/extension sweep.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -32,12 +33,14 @@ from typing import Any
 
 SETTINGS_PACK_VERSION = 1
 CHATS_PACK_VERSION = 1
-MEMORY_PACK_VERSION = 1
 SETTINGS_PACK_FORMAT = "khan-settings"
 CHATS_PACK_FORMAT = "khan-chats"
 KURULTAI_INBOX_REL = "usr/kurultai-inbox/chats"
 
-# Keys that never leave the box and are never overwritten by an import.
+# Keys that never leave the box and are never overwritten by an import —
+# credentials, secret blobs, and capability pivots (settings that make the
+# host DO something: spawn MCP stdio servers, pivot filesystem roots,
+# inject prompt variables, redirect model traffic).
 SENSITIVE_SETTINGS_KEYS = (
     "api_keys",
     "auth_login",
@@ -45,8 +48,48 @@ SENSITIVE_SETTINGS_KEYS = (
     "rfc_password",
     "root_password",
     "mcp_server_token",
+    "mcp_servers",          # RCE sink: import -> MCPConfig.update spawns stdio commands
+    "litellm_global_kwargs",  # merged into every model call: api_base/api_key hijack
+    "variables",            # rendered into the system prompt -> injection
+    "agent_profile",        # selects prompt/profile set on deserialize
+    "agent_knowledge_subdir",
     "secrets",
 )
+
+# Key-shape rules: these classes carry capabilities, not preferences.
+# Pattern-matched so NEW dangerous keys a0 adds fail closed instead of
+# silently syncing.
+_SENSITIVE_SUFFIXES = (
+    "_path",
+    "_dir",
+    "_subdir",
+    "_url",
+    "_uri",
+    "_addr",
+    "_cmd",
+    "_command",
+    "_kwargs",   # *_model_kwargs can carry api_base/api_key overrides
+    "_servers",
+    "_token",
+    "_password",
+    "_secret",
+    "_key",
+    "_keys",
+    "_headers",
+    "_server_enabled",
+)
+_SENSITIVE_PREFIXES = ("rfc_", "a2a_")
+
+
+def is_sensitive_key(key: Any) -> bool:
+    """True when a settings key carries a credential or a capability —
+    excluded from export, dropped on import, skipped by the conflict diff."""
+    k = str(key).lower()
+    return (
+        k in SENSITIVE_SETTINGS_KEYS
+        or k.startswith(_SENSITIVE_PREFIXES)
+        or k.endswith(_SENSITIVE_SUFFIXES)
+    )
 
 # Continuity pack limits (authenticated callers still get bounded processing)
 MAX_PACK_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -57,17 +100,30 @@ MAX_ZIP_COMPRESSION_RATIO = 100.0
 REQUIRED_ATOM_FIELDS = ("id", "title", "content", "tags")
 
 
-def _utc_now_iso() -> str:
+def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _blank(value: Any) -> Any:
+    """Type-preserving empty value for a stripped setting."""
+    if isinstance(value, dict):
+        return {}
+    if isinstance(value, list):
+        return []
+    return ""
+
+
 def strip_sensitive_settings(data: dict[str, Any]) -> dict[str, Any]:
+    """Blank sensitive/capability keys in place-value-preserving form —
+    the pack keeps the key name so diffs see its presence, never its
+    value."""
     cleaned = dict(data)
+    for key, value in list(cleaned.items()):
+        if is_sensitive_key(key):
+            cleaned[key] = _blank(value)
     for key in SENSITIVE_SETTINGS_KEYS:
-        if key == "api_keys":
-            cleaned[key] = {}
-        else:
-            cleaned[key] = ""
+        if key not in cleaned:
+            cleaned[key] = _blank(None)
     return cleaned
 
 
@@ -80,7 +136,7 @@ def build_settings_pack() -> dict[str, Any]:
     return {
         "format": SETTINGS_PACK_FORMAT,
         "version": SETTINGS_PACK_VERSION,
-        "exported_at": _utc_now_iso(),
+        "exported_at": utc_now_iso(),
         "settings": prefs,
     }
 
@@ -93,20 +149,21 @@ def import_settings_pack(pack: dict[str, Any]) -> Any:
         raise ValueError("Settings pack must be a JSON object")
     if pack.get("format") != SETTINGS_PACK_FORMAT:
         raise ValueError(f"Unsupported settings pack format: {pack.get('format')!r}")
-    if "version" not in pack:
-        raise ValueError("Settings pack missing version")
-    if int(pack["version"]) != SETTINGS_PACK_VERSION:
-        raise ValueError(f"Unsupported settings pack version: {pack.get('version')}")
+    version = pack.get("version")
+    # strict int compare — `int(1.9)` truncating to a pass is a compat hole
+    if not isinstance(version, int) or isinstance(version, bool) or version != SETTINGS_PACK_VERSION:
+        raise ValueError(f"Unsupported settings pack version: {version!r}")
     incoming = pack.get("settings")
     if not isinstance(incoming, dict):
         raise ValueError("Settings pack missing 'settings' object")
 
     current = settings.get_settings()
-    overlay = {k: v for k, v in incoming.items() if k not in SENSITIVE_SETTINGS_KEYS}
+    overlay = {k: v for k, v in incoming.items() if not is_sensitive_key(k)}
 
     merged = {**current, **overlay}
-    for key in SENSITIVE_SETTINGS_KEYS:
-        merged[key] = current.get(key, {} if key == "api_keys" else "")
+    for key in current:
+        if is_sensitive_key(key):
+            merged[key] = current[key]  # local values always win
 
     return settings.set_settings(merged)  # type: ignore[arg-type]
 
@@ -222,7 +279,7 @@ def build_chats_zip_bytes(ctxids: list[str] | None = None) -> tuple[bytes, dict[
     manifest = {
         "format": CHATS_PACK_FORMAT,
         "version": CHATS_PACK_VERSION,
-        "exported_at": _utc_now_iso(),
+        "exported_at": utc_now_iso(),
         "chat_count": len(pairs),
         "chat_ids": [cid for cid, _ in pairs],
         "kurultai_atoms": ndjson.count("\n") if ndjson else 0,
@@ -232,10 +289,19 @@ def build_chats_zip_bytes(ctxids: list[str] | None = None) -> tuple[bytes, dict[
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("manifest.json", json.dumps(manifest, indent=2))
         for ctxid, js in pairs:
-            safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in ctxid)
-            zf.writestr(f"chats/{safe}.json", js)
+            zf.writestr(f"chats/{_safe_chat_name(ctxid)}.json", js)
         zf.writestr("kurultai/chats.ndjson", ndjson)
     return buffer.getvalue(), manifest
+
+
+def _safe_chat_name(ctxid: str) -> str:
+    """Sanitize a ctxid for a zip member name; append a short hash so that
+    ctxids colliding after sanitization ('a:b' vs 'a_b') produce distinct
+    members — otherwise the pack fails its own count check on import."""
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in ctxid)
+    if safe != ctxid:
+        safe = f"{safe}-{hashlib.sha256(ctxid.encode()).hexdigest()[:8]}"
+    return safe or "chat"
 
 
 def build_memory_pack(atoms: list[dict[str, Any]]) -> bytes:
@@ -303,9 +369,14 @@ def _assert_zip_bounds(zf: zipfile.ZipFile) -> None:
 
 
 def extract_chats_from_zip(zip_bytes: bytes) -> tuple[dict[str, Any], list[str], str]:
-    """Return (manifest, chat_json_strings, ndjson_text)."""
+    """Return (manifest, chat_json_strings, ndjson_text). Entries are read
+    to memory only — member names never reach a filesystem path."""
     assert_upload_size(zip_bytes, label="chats pack")
-    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+    try:
+        zf_ctx = zipfile.ZipFile(io.BytesIO(zip_bytes), "r")
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"chats pack is not a ZIP: {exc}") from exc
+    with zf_ctx as zf:
         _assert_zip_bounds(zf)
         names = set(zf.namelist())
         if "manifest.json" not in names:
@@ -341,11 +412,63 @@ def extract_chats_from_zip(zip_bytes: bytes) -> tuple[dict[str, Any], list[str],
 
 
 def import_chat_jsons(chat_jsons: list[str]) -> list[str]:
+    """Import chat JSONs with real ctxid dedupe — returns imported ctxids.
+
+    ``persist_chat.load_json_chats`` deletes ``id`` and mints a fresh
+    ctxid per chat — a0's import is a COPY, not a sync. Naively calling it
+    duplicates every chat each round, and worse: the copies re-export
+    under their new ids, so A→B→A echo grows forever. We therefore parse
+    each pack chat's original ``id``, skip ids the host already knows
+    (live ``AgentContext.all()`` ∪ persisted ``saved_chat_ids()``), and
+    deserialize the novel ones with the original id preserved
+    (``_deserialize_context`` honors ``data["id"]`` — never re-feed a
+    known id: constructing a context over a live id kills its task).
+
+    An empty list is a successful no-op — a zero-chat peer produces a
+    valid pack."""
     if not chat_jsons:
-        raise ValueError("No chats to import")
+        return []
+    from agent import AgentContext
     from helpers import persist_chat
 
-    return persist_chat.load_json_chats(chat_jsons)
+    known = {c.id for c in AgentContext.all()}
+    try:
+        known |= set(persist_chat.saved_chat_ids())
+    except Exception:
+        pass
+
+    # parse once; only novel, well-formed, id-bearing chats proceed
+    novel: list[tuple[str, dict[str, Any]]] = []
+    for js in chat_jsons:
+        try:
+            data = json.loads(js)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        cid = str(data.get("id") or "")
+        if cid and cid not in known:
+            novel.append((js, data))
+            known.add(cid)
+
+    deserialize = getattr(persist_chat, "_deserialize_context", None)
+    if deserialize is None:
+        # Host moved the seam — copy-import still dedupes by ORIGINAL id
+        # (fresh local ids, but the same pack never re-imports).
+        return persist_chat.load_json_chats([js for js, _ in novel])
+
+    imported: list[str] = []
+    for _js, data in novel:
+        try:
+            ctx = deserialize(data)
+        except Exception:
+            continue  # one malformed chat must not fail the pack
+        imported.append(ctx.id)
+        try:
+            persist_chat.save_tmp_chat(ctx)
+        except Exception:
+            pass
+    return imported
 
 
 def kurultai_inbox_dir() -> str:
@@ -363,40 +486,27 @@ def write_kurultai_ndjson(ndjson: str, filename: str | None = None) -> str:
     validate_kurultai_ndjson(ndjson)
     inbox = kurultai_inbox_dir()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    prefix = Path(filename).name if filename else f"khan-chats-{stamp}"
+    prefix = Path(filename).name if filename else f"{CHATS_PACK_FORMAT}-{stamp}"
     prefix = Path(prefix).stem
     prefix = "".join(c if c.isalnum() or c in "-_" else "_" for c in prefix) or "khan-chats"
 
     payload = ndjson if ndjson.endswith("\n") else ndjson + "\n"
-    fd, dest = tempfile.mkstemp(dir=inbox, prefix=f"{prefix}-", suffix=".ndjson")
+    # tmp + os.replace: a scanning consumer must never see a partial file.
+    fd, tmp = tempfile.mkstemp(dir=inbox, prefix=f".{prefix}-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
+        import secrets
+
+        dest = os.path.join(inbox, f"{prefix}-{secrets.token_hex(4)}.ndjson")
+        os.replace(tmp, dest)
     except Exception:
         try:
-            os.unlink(dest)
+            os.unlink(tmp)
         except OSError:
             pass
         raise
     return dest
-
-
-def write_temp_file(content: bytes, suffix: str) -> str:
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(content)
-    except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-        raise
-    return path
 
 
 def build_chats_zip_file(path: str, ctxids: list[str] | None = None) -> dict[str, Any]:
@@ -408,7 +518,7 @@ def build_chats_zip_file(path: str, ctxids: list[str] | None = None) -> dict[str
     manifest = {
         "format": CHATS_PACK_FORMAT,
         "version": CHATS_PACK_VERSION,
-        "exported_at": _utc_now_iso(),
+        "exported_at": utc_now_iso(),
         "chat_count": len(pairs),
         "chat_ids": [cid for cid, _ in pairs],
         "kurultai_atoms": ndjson.count("\n") if ndjson else 0,
@@ -416,8 +526,7 @@ def build_chats_zip_file(path: str, ctxids: list[str] | None = None) -> dict[str
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("manifest.json", json.dumps(manifest, indent=2))
         for ctxid, js in pairs:
-            safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in ctxid)
-            zf.writestr(f"chats/{safe}.json", js)
+            zf.writestr(f"chats/{_safe_chat_name(ctxid)}.json", js)
         zf.writestr("kurultai/chats.ndjson", ndjson)
     return manifest
 

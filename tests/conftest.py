@@ -6,8 +6,10 @@ plugins / extension, agent) so everything runs standalone, offline.
 The stubs model a0's real contracts:
 
 - settings: one in-memory dict; set_settings replaces and returns it.
-- persist_chat: load_json_chats dedupes on chat id (a0 dedupes on ctxid —
-  a re-imported chat is skipped, not overwritten).
+- persist_chat: the REAL a0 contract — load_json_chats DELETES `id` and
+  mints fresh ctxids (import is a copy, no dedupe); _deserialize_context
+  honors a preserved `id`; saved_chat_ids() reports persisted ids. Chat
+  dedupe is the PLUGIN's job — these stubs make a regression visible.
 - agent: AgentContext registry with USER/BACKGROUND types.
 - helpers.api: ApiHandler + Response (status/mimetype/call_on_close) +
   send_file returning a Response; Request with headers + get_data().
@@ -96,14 +98,25 @@ class ApiHandler:
         raise NotImplementedError
 
 
+class _Headers(dict):
+    """Case-insensitive header lookup, like werkzeug's Headers."""
+
+    def get(self, key, default=None):
+        for k, v in self.items():
+            if k.lower() == str(key).lower():
+                return v
+        return default
+
+
 class FakeRequest:
     """werkzeug Request stand-in: headers dict + raw body."""
 
     def __init__(self, path="/api/x", method="POST", headers=None, data=b""):
         self.path = path
         self.method = method
-        self.headers = dict(headers or {})
+        self.headers = _Headers(headers or {})
         self._data = data
+        self.content_length = len(data)
 
     def get_data(self):
         return self._data
@@ -145,17 +158,34 @@ def _export_json_chat(context):
 
 
 def _load_json_chats(chat_jsons):
-    """a0's real contract: returns ctxids of chats actually imported;
-    existing ctxids are skipped (idempotent)."""
-    imported = []
+    """a0's REAL contract: `del data["id"]` then _deserialize_context —
+    every chat gets a FRESH ctxid. No dedupe exists here; callers that
+    need idempotency must dedupe upstream (packs.import_chat_jsons does)."""
+    out = []
     for js in chat_jsons:
         data = json.loads(js)
-        ctxid = str(data.get("id"))
-        if ctxid in _chats_store:
-            continue
-        _chats_store[ctxid] = js
-        imported.append(ctxid)
-    return imported
+        data.pop("id", None)  # remove id to get new — verbatim host behavior
+        ctxid = data["id"] = f"fresh-{len(_chats_store):04d}-{len(out)}"
+        _chats_store[ctxid] = json.dumps(data)
+        AgentContext(ctxid)
+        out.append(ctxid)
+    return out
+
+
+def _deserialize_context(data):
+    """Host's context deserializer — honors data["id"] when present."""
+    ctxid = str(data.get("id") or f"fresh-{len(_chats_store):04d}")
+    ctx = AgentContext(ctxid)
+    _chats_store[ctxid] = json.dumps(data)
+    return ctx
+
+
+def _save_tmp_chat(ctx):
+    _chats_store[ctx.id] = json.dumps({"id": ctx.id, "name": f"chat-{ctx.id}"})
+
+
+def _saved_chat_ids():
+    return set(_chats_store)
 
 
 class AgentContextType:
@@ -174,6 +204,10 @@ class AgentContext:
     @classmethod
     def all(cls):
         return list(cls._contexts.values())
+
+    @classmethod
+    def get(cls, ctxid):
+        return cls._contexts.get(ctxid)
 
     @classmethod
     def _clear(cls):
@@ -214,6 +248,9 @@ _persist_mod = types.ModuleType("helpers.persist_chat")
 _persist_mod.save_tmp_chats = _save_tmp_chats
 _persist_mod.export_json_chat = _export_json_chat
 _persist_mod.load_json_chats = _load_json_chats
+_persist_mod._deserialize_context = _deserialize_context
+_persist_mod.save_tmp_chat = _save_tmp_chat
+_persist_mod.saved_chat_ids = _saved_chat_ids
 _persist_mod._store = _chats_store
 _helpers.persist_chat = _persist_mod
 
@@ -312,13 +349,40 @@ class DictMemoryBackend:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_env(monkeypatch, tmp_path):
+    """Ambient DEVICE_SYNC_* env vars and real filesystem paths must never
+    reach tests — _merge_env applies env even over explicit config dicts,
+    and helpers.files would default to a shared /tmp root."""
+    for var in (
+        "DEVICE_SYNC_ENABLED",
+        "DEVICE_SYNC_TOKEN",
+        "DEVICE_SYNC_PEERS_FILE",
+        "DEVICE_SYNC_PEER_PORT",
+        "DEVICE_SYNC_INTERVAL_S",
+        "DEVICE_SYNC_TIMEOUT_S",
+        "DEVICE_SYNC_MEMORY_BACKEND",
+        "DEVICE_SYNC_MEMORY_DIR",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(
+        _files_mod, "get_abs_path", lambda rel: str(tmp_path / rel)
+    )
+
+
+@pytest.fixture(autouse=True)
 def _clean_runtime():
     """Every test starts unconfigured: no engine, no config, no custom
-    backend registrations."""
+    backend registrations, clean host state."""
     from usr.plugins.device_sync.helpers import memory_backend, runtime
 
     runtime._reset()
     memory_backend.reset_backends()
+    _settings_state.clear()
+    _chats_store.clear()
+    AgentContext._clear()
     yield
     runtime._reset()
     memory_backend.reset_backends()
+    _settings_state.clear()
+    _chats_store.clear()
+    AgentContext._clear()

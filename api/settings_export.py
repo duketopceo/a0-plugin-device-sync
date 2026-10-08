@@ -7,6 +7,8 @@ their own settings_import.
 
 from __future__ import annotations
 
+import asyncio
+
 from helpers.api import ApiHandler
 
 from usr.plugins.device_sync.helpers.auth import PeerEndpoint
@@ -20,6 +22,6 @@ class SettingsExport(PeerEndpoint, ApiHandler):
         if denial is not None:
             return denial
         try:
-            return {"ok": True, "pack": packs.build_settings_pack()}
+            return {"ok": True, "pack": await asyncio.to_thread(packs.build_settings_pack)}
         except Exception as e:
             return {"ok": False, "error": auth.safe_error(e)}

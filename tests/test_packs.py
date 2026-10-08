@@ -32,6 +32,13 @@ def _seed_settings(state):
             "auth_password": "hunter2",
             "secrets": {"token": "abc"},
             "rfc_password": "pw",
+            # capability-bearing keys — pattern-matched sensitive
+            "mcp_servers": '{"mcpServers": {"x": {"command": "/bin/sh"}}}',
+            "litellm_global_kwargs": {"api_key": "sk-leak", "api_base": "https://evil"},
+            "variables": "KEY=VAL",
+            "workdir_path": "/etc",
+            "rfc_url": "attacker.example",
+            "agent_profile": "evil-profile",
         }
     )
     return state
@@ -46,10 +53,16 @@ def test_build_settings_pack_scrubs_secrets(settings_state):
     s = pack["settings"]
     assert s["chat_model_provider"] == "openrouter"
     for key in SENSITIVE_SETTINGS_KEYS:
-        assert s[key] == ({} if key == "api_keys" else "")
+        assert s[key] in ("", {}, [])
     blob = json.dumps(pack)
     assert "sk-secret-1" not in blob
     assert "hunter2" not in blob
+    # capability keys scrubbed by pattern, not just the named list
+    for dangerous in ("mcp_servers", "litellm_global_kwargs", "variables",
+                      "workdir_path", "rfc_url", "agent_profile"):
+        assert s[dangerous] in ("", {}, [])
+    assert "evil.example" not in blob
+    assert "/bin/sh" not in blob
 
 
 def test_import_settings_pack_overlays_and_preserves_secrets(settings_state):
@@ -189,12 +202,13 @@ def test_chats_zip_round_trip(chats_store):
     assert sorted(manifest["chat_ids"]) == ["c1", "c2"]
 
     # importing into a fresh instance: both chats land; re-import dedupes
+    AgentContext._clear()  # fresh instance — the contexts aren't live here
     chats_store.clear()
     _m, chat_jsons, ndjson = packs.extract_chats_from_zip(zip_bytes)
     assert len(chat_jsons) == 2
     first = packs.import_chat_jsons(chat_jsons)
     second = packs.import_chat_jsons(chat_jsons)
-    assert sorted(first) == ["c1", "c2"]
+    assert sorted(first) == ["c1", "c2"]  # original ctxids preserved
     assert second == []
     assert ndjson.strip()
 
@@ -317,11 +331,10 @@ def test_iter_memory_pack_rejects_malformed():
         list(packs.iter_memory_pack(b'{"id":"ok"}\n{bad}\n'))
 
 
-def test_send_temp_file_cleans_up():
-    p = packs.write_temp_file(b"zip", ".zip")
-    resp = packs.send_temp_file(p, download_name="x.zip", mimetype="application/zip")
+def test_send_temp_file_cleans_up(tmp_path):
+    p = tmp_path / "pack.zip"
+    p.write_bytes(b"zip")
+    resp = packs.send_temp_file(str(p), download_name="x.zip", mimetype="application/zip")
     assert resp.get_data() == b"zip"
     resp.close()
-    import os
-
-    assert not os.path.exists(p)
+    assert not p.exists()

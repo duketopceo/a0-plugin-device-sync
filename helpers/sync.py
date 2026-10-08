@@ -29,9 +29,10 @@ Design constraints kept from Khan:
 from __future__ import annotations
 
 import json
+import random
 import shutil
-import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -62,6 +63,9 @@ DEFAULT_SYNC_INTERVAL = 300
 # callers share one fresh result for this window instead of re-probing.
 DISCOVERY_TTL_S = 60.0
 PROBE_WORKERS = 8
+# An interval under this is a retry storm (tailscale subprocess + probes +
+# full pack exchange per peer per tick).
+MIN_AUTO_SYNC_INTERVAL_S = 60
 
 DEFAULT_PEERS_FILE = Path.home() / ".a0-device-sync" / "peers.json"
 
@@ -94,9 +98,16 @@ class PeerDevice:
     @property
     def base_url(self) -> str:
         host = self.host
-        if not host.startswith(("http://", "https://")):
-            host = f"http://{host}"
-        return f"{host.rstrip('/')}:{self.port}"
+        scheme = "http://"
+        if "://" in host:
+            scheme, host = host.split("://", 1)
+            scheme = f"{scheme}://"
+        host = host.rstrip("/")
+        # A host that already carries a port ("x:8080", "[::1]:8080") is
+        # used as-is; a bare IPv6 literal stays bracketed.
+        if ":" in host and not host.startswith("[") or "]:" in host:
+            return f"{scheme}{host}"
+        return f"{scheme}{host}:{self.port}"
 
 
 @dataclass
@@ -126,7 +137,15 @@ class SyncResult:
 
 SyncDirection = str  # "push" | "pull" | "bidirectional"
 
-_utc_now_iso = packs._utc_now_iso  # single implementation, same package
+utc_now_iso = packs.utc_now_iso  # single implementation, same package
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects — a redirect surfaces as its 3xx status (an error
+    path for callers) instead of re-sending auth headers elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
 
 
 class ContinuitySync:
@@ -151,8 +170,20 @@ class ContinuitySync:
         self.token = token
         self.timeout = timeout
         self._peers: dict[str, PeerDevice] = {}
+        # Redirects are refused: urllib would re-send the Authorization
+        # header to the redirect target, and a hostile peers-file entry
+        # could bounce a sync POST to an arbitrary host — token leak.
+        # ProxyHandler({}) disables ambient http_proxy env vars for the
+        # same reason — a proxy would otherwise receive the bearer token.
+        self._opener = urllib.request.build_opener(
+            _NoRedirect(), urllib.request.ProxyHandler({})
+        )
         self._loop_thread: threading.Thread | None = None
         self._loop_stop = threading.Event()
+        # start/stop mutate the thread+event pair under one lock — a
+        # racing stop() can otherwise signal the wrong Event or miss a
+        # not-yet-registered thread, orphaning a live daemon.
+        self._lifecycle_lock = threading.Lock()
         # one sync operation at a time (auto-sync loop vs manual sync_now)
         self._sync_lock = threading.Lock()
         self._discovered_at = 0.0  # monotonic; discovery TTL cache
@@ -215,18 +246,63 @@ class ContinuitySync:
         # and a misbehaving peer can't force unbounded memory on the pull path.
         read_cap = packs.MAX_PACK_UPLOAD_BYTES + 1
         try:
-            resp = urllib.request.urlopen(  # noqa: S310
+            resp = self._opener.open(
                 req, timeout=timeout if timeout is not None else self.timeout
             )
-            body = resp.read(read_cap)
-            status = resp.status
-            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-            resp.close()
-            return status, body, resp_headers
+            try:
+                body = resp.read(read_cap)
+            finally:
+                resp.close()
+            return resp.status, body, {k.lower(): v for k, v in resp.headers.items()}
         except urllib.error.HTTPError as exc:
-            body = exc.read(read_cap) if exc.fp else b""
+            try:
+                body = exc.read(read_cap) if exc.fp else b""
+            finally:
+                exc.close()
             resp_headers = {k.lower(): v for k, v in exc.headers.items()} if exc.headers else {}
             return exc.code, body, resp_headers
+
+    @staticmethod
+    def _truncated(body: bytes) -> bool:
+        """Response hit the read cap — pack is incomplete and must not be
+        imported (a boundary-cut NDJSON could otherwise import silently)."""
+        return len(body) > packs.MAX_PACK_UPLOAD_BYTES
+
+    @staticmethod
+    def _server_error(body: bytes) -> str | None:
+        """Best-effort extraction of a peer's ``error`` field — import
+        handlers return ``{"ok": false, "error": ...}`` at HTTP 200."""
+        try:
+            parsed = json.loads(body.decode("utf-8", errors="replace")) if body else {}
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict) and parsed.get("ok") is False:
+            return str(parsed.get("error") or "peer rejected the pack")
+        return None
+
+    def _import_response_ok(
+        self, status: int, body: bytes, label: str, result: SyncResult
+    ) -> tuple[bool, dict[str, Any]]:
+        """Check an import endpoint's response. Handlers report domain
+        errors as ``{"ok": false}`` at HTTP 200 — status alone is not
+        success. Returns (ok, parsed_body)."""
+        if not 200 <= status < 300:
+            result.add_error(
+                f"{label} HTTP {status}: {body[:200].decode('utf-8', 'replace')}"
+            )
+            return False, {}
+        parsed: dict[str, Any] = {}
+        try:
+            decoded = json.loads(body.decode("utf-8", errors="replace")) if body else {}
+            if isinstance(decoded, dict):
+                parsed = decoded
+        except json.JSONDecodeError:
+            pass
+        if parsed.get("ok") is not True:
+            err = parsed.get("error") or "peer did not confirm the import"
+            result.add_error(f"{label}: {err}")
+            return False, parsed
+        return True, parsed
 
     # ------------------------------------------------------------------ #
     # peer discovery
@@ -256,11 +332,18 @@ class ContinuitySync:
         manual peers file. Probing is what makes a peer "an a0 box".
         Results are TTL-cached — repeated callers within DISCOVERY_TTL_S
         reuse the last discovery instead of re-probing every device."""
-        if not force and time.monotonic() - self._discovered_at < DISCOVERY_TTL_S:
+        # 0.0 sentinel: monotonic() is seconds-since-boot — inside the first
+        # TTL window of uptime an empty cache would otherwise read "fresh".
+        if (
+            not force
+            and self._discovered_at
+            and time.monotonic() - self._discovered_at < DISCOVERY_TTL_S
+        ):
             return list(self._peers.values())
 
         candidates: list[PeerDevice] = []
         seen: set[str] = set()
+        seen_names: set[str] = set()
 
         ts = self._run_tailscale_status()
         if ts:
@@ -276,13 +359,20 @@ class ContinuitySync:
                     if host_name == self_name:
                         continue
                     ips = info.get("TailscaleIPs") or info.get("Addrs") or []
-                    ts_ip = ips[0] if isinstance(ips, list) and ips else ""
+                    # Prefer a v4 address — base_url bracket-formats v6 but
+                    # mixed stacks reach v4 more reliably.
+                    ts_ip = ""
+                    if isinstance(ips, list):
+                        v4 = [i for i in ips if i and ":" not in str(i)]
+                        pick = v4[0] if v4 else (ips[0] if ips else "")
+                        ts_ip = str(pick)
                     if not ts_ip:
                         continue
                     host = ts_ip if "/" not in ts_ip else ts_ip.split("/")[0]
-                    if host in seen:
+                    if host in seen or host_name in seen_names:
                         continue
                     seen.add(host)
+                    seen_names.add(host_name)
                     candidates.append(
                         PeerDevice(
                             name=host_name, host=host,
@@ -290,8 +380,13 @@ class ContinuitySync:
                         )
                     )
 
-        if not candidates:
-            candidates = self._load_peers_file()
+        # Union, not fallback: manual peers coexist with tailscale peers —
+        # mixed tailnet + manual setups must see both sets.
+        for p in self._load_peers_file():
+            if p.host not in seen and p.name not in seen_names:
+                seen.add(p.host)
+                seen_names.add(p.name)
+                candidates.append(p)
 
         # Probe concurrently — a 20-device tailnet of non-a0 boxes would
         # otherwise cost N x PEER_PROBE_TIMEOUT serially.
@@ -303,16 +398,22 @@ class ContinuitySync:
             peers = []
 
         # Rebuild the cache from the fresh list (stale names expire);
-        # merge prior last_sync bookkeeping onto surviving peers.
+        # merge prior last_sync bookkeeping onto surviving peers. Build
+        # privately then swap — status() iterates _peers concurrently.
         old = self._peers
-        self._peers = {}
+        new: dict[str, PeerDevice] = {}
         for peer in peers:
             prev = old.get(peer.name)
             if prev is not None:
                 peer.last_sync = prev.last_sync
                 peer.last_sync_status = prev.last_sync_status
-            self._peers[peer.name] = peer
-        self._discovered_at = time.monotonic()
+            new[peer.name] = peer
+        self._peers = new
+        # Only stamp the TTL cache when discovery actually ran — a
+        # transient `tailscale status` failure must not cache an empty
+        # result for the whole window.
+        if ts or self.peers_file.exists():
+            self._discovered_at = time.monotonic()
         return peers
 
     def _load_peers_file(self) -> list[PeerDevice]:
@@ -329,11 +430,14 @@ class ContinuitySync:
             if not isinstance(entry, dict):
                 continue
             try:
+                port = int(entry.get("port", self.peer_port))
+                if not 1 <= port <= 65535:
+                    continue
                 out.append(
                     PeerDevice(
                         name=str(entry.get("name") or entry.get("host") or "peer"),
                         host=str(entry["host"]),
-                        port=int(entry.get("port", self.peer_port)),
+                        port=port,
                         ts_hostname=str(
                             entry.get("ts_hostname") or entry.get("name") or ""
                         ),
@@ -346,46 +450,49 @@ class ContinuitySync:
         return out
 
     def _is_peer(self, peer: PeerDevice) -> bool:
-        """TCP-connect probe — cheap primary check that the port answers.
-        The a0 port is shared with the app, so answering is the claim;
-        the sync calls themselves validate by pack format."""
+        """Identity probe — POST the peers endpoint WITHOUT credentials and
+        require the plugin's 403 {"ok": false, "forbidden"} signature. A
+        bare TCP check only proves SOMETHING answers on the port — without
+        identity verification, every listening device on the tailnet
+        (including shared-in and compromised devices) would receive the
+        bearer token and full packs on the next sync."""
+        url = f"{peer.base_url}/api/plugins/device_sync/peers"
+        req = urllib.request.Request(
+            url,
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": _UA},
+        )
         try:
-            with socket.create_connection(
-                (peer.host, peer.port), timeout=PEER_PROBE_TIMEOUT
-            ):
-                return True
-        except OSError:
+            resp = self._opener.open(req, timeout=PEER_PROBE_TIMEOUT)
+            resp.close()
+            return False  # 2xx without a token — not the plugin's shape
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read(4096)
+            finally:
+                exc.close()
+            return exc.code == 403 and b"forbidden" in body
+        except Exception:
             return False
 
     def peer_by_name(self, name: str | None) -> PeerDevice | None:
+        """Resolve a named peer; a cache miss triggers a FORCED discovery —
+        an explicit name is operator-driven, so the TTL's "just-online"
+        blind spot is worth paying a probe round to avoid."""
         if not name:
             return None
         peer = self._peers.get(name)
         if peer is not None:
             return peer
-        self.discover_peers()
+        self.discover_peers(force=True)
         return self._peers.get(name)
 
     # ------------------------------------------------------------------ #
     # push / pull / bidirectional
     # ------------------------------------------------------------------ #
 
-    def sync_to_peer(self, peer: PeerDevice, **kwargs: Any) -> SyncResult:
-        """Guarded push — reports failure rather than overlapping an
-        in-progress sync (auto-sync loop vs manual trigger)."""
-        if not self._sync_lock.acquire(blocking=False):
-            result = SyncResult(
-                peer=peer.name, direction="push", started_at=_utc_now_iso()
-            )
-            result.add_error("another sync is already running")
-            result.finished_at = _utc_now_iso()
-            return result
-        try:
-            return self._push(peer, **kwargs)
-        finally:
-            self._sync_lock.release()
-
-    def _push(
+    def sync_to_peer(
         self,
         peer: PeerDevice,
         *,
@@ -393,30 +500,63 @@ class ContinuitySync:
         chats_zip: bytes | None = None,
         memory_ndjson: bytes | None = None,
     ) -> SyncResult:
+        """Guarded push — reports failure rather than overlapping an
+        in-progress sync (auto-sync loop vs manual trigger). Callers
+        syncing N peers may pass prebuilt packs so identical artifacts
+        aren't rebuilt per peer."""
+        if not self._sync_lock.acquire(blocking=False):
+            result = SyncResult(
+                peer=peer.name, direction="push", started_at=utc_now_iso()
+            )
+            result.add_error("another sync is already running")
+            result.finished_at = utc_now_iso()
+            return result
+        try:
+            return self._push(
+                peer,
+                settings_pack=settings_pack,
+                chats_zip=chats_zip,
+                memory_ndjson=memory_ndjson,
+            )
+        finally:
+            self._sync_lock.release()
+
+    def _push(
+        self,
+        peer: PeerDevice,
+        *,
+        push_settings: bool = True,
+        settings_pack: dict[str, Any] | None = None,
+        chats_zip: bytes | None = None,
+        memory_ndjson: bytes | None = None,
+    ) -> SyncResult:
         """Push settings + chats + memory packs to a peer's import endpoints.
-        Memory is skipped when nothing is exportable — the same
+        ``push_settings=False`` skips the settings leg — bidirectional sync
+        never writes settings to either side (diff-only contract).
+
+        Import handlers report domain errors as ``{"ok": false}`` at HTTP
+        200 — status alone is NOT success, so every response's envelope is
+        checked. Memory is skipped when nothing is exportable — the same
         "unsupported" condition a 404 reports on a peer without endpoints.
-        Callers syncing N peers may pass prebuilt packs so identical
-        artifacts aren't rebuilt per peer."""
-        result = SyncResult(peer=peer.name, direction="push", started_at=_utc_now_iso())
+        """
+        result = SyncResult(peer=peer.name, direction="push", started_at=utc_now_iso())
         base = peer.base_url
 
-        try:
-            if settings_pack is None:
-                settings_pack = packs.build_settings_pack()
-            status, body, _ = self._http_post_json(
-                f"{base}{ENDPOINTS['settings_import']}", {"pack": settings_pack}
-            )
-            if 200 <= status < 300:
-                result.settings = True
-            else:
-                result.add_error(
-                    f"settings_import HTTP {status}: {body.decode('utf-8', 'replace')[:200]}"
+        if push_settings:
+            try:
+                if settings_pack is None:
+                    settings_pack = packs.build_settings_pack()
+                status, body, _ = self._http_post_json(
+                    f"{base}{ENDPOINTS['settings_import']}", {"pack": settings_pack}
                 )
-        except OSError as exc:
-            result.add_error(f"settings push unreachable: {exc}")
-        except Exception as exc:
-            result.add_error(f"settings push failed: {exc}")
+                ok, _parsed = self._import_response_ok(
+                    status, body, "settings_import", result
+                )
+                result.settings = ok
+            except OSError as exc:
+                result.add_error(f"settings push unreachable: {exc}")
+            except Exception as exc:
+                result.add_error(f"settings push failed: {exc}")
 
         try:
             if chats_zip is None:
@@ -426,20 +566,14 @@ class ContinuitySync:
                 chats_zip,
                 headers={"Content-Type": "application/zip"},
             )
-            if 200 <= status < 300:
+            ok, parsed = self._import_response_ok(
+                status, body, "chats_import", result
+            )
+            if ok:
                 result.chats = True
-                try:
-                    parsed = json.loads(body.decode("utf-8", errors="replace")) if body else {}
-                    if isinstance(parsed, dict):
-                        ids = parsed.get("ctxids") or []
-                        if isinstance(ids, list):
-                            result.chats_imported = len(ids)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    pass
-            else:
-                result.add_error(
-                    f"chats_import HTTP {status}: {body.decode('utf-8', 'replace')[:200]}"
-                )
+                ids = parsed.get("ctxids") or []
+                if isinstance(ids, list):
+                    result.chats_imported = len(ids)
         except OSError as exc:
             result.add_error(f"chats push unreachable: {exc}")
         except Exception as exc:
@@ -458,20 +592,23 @@ class ContinuitySync:
                     memory_ndjson,
                     headers={"Content-Type": "application/x-ndjson"},
                 )
-                if 200 <= status < 300:
-                    result.memory = True
-                elif status == 404:
+                if status == 404:
                     result.memory = False  # peer predates memory endpoints
                 else:
-                    result.add_error(
-                        f"memory_import HTTP {status}: {body.decode('utf-8', 'replace')[:200]}"
+                    ok, parsed = self._import_response_ok(
+                        status, body, "memory_import", result
                     )
+                    if ok:
+                        result.memory = True
+                        imported = parsed.get("imported")
+                        if isinstance(imported, int):
+                            result.atoms_imported = imported
         except OSError as exc:
             result.add_error(f"memory push unreachable: {exc}")
         except Exception as exc:
             result.add_error(f"memory push failed: {exc}")
 
-        result.finished_at = _utc_now_iso()
+        result.finished_at = utc_now_iso()
         self._record_peer_outcome(peer, result)
         return result
 
@@ -480,10 +617,10 @@ class ContinuitySync:
         in-progress sync (auto-sync loop vs manual trigger)."""
         if not self._sync_lock.acquire(blocking=False):
             result = SyncResult(
-                peer=peer.name, direction="pull", started_at=_utc_now_iso()
+                peer=peer.name, direction="pull", started_at=utc_now_iso()
             )
             result.add_error("another sync is already running")
-            result.finished_at = _utc_now_iso()
+            result.finished_at = utc_now_iso()
             return result
         try:
             result, _remote = self._pull(peer)
@@ -491,28 +628,46 @@ class ContinuitySync:
         finally:
             self._sync_lock.release()
 
-    def _pull(self, peer: PeerDevice) -> tuple[SyncResult, dict[str, Any]]:
+    def _pull(
+        self, peer: PeerDevice, *, apply_settings: bool = True
+    ) -> tuple[SyncResult, dict[str, Any]]:
         """Pull + return the remote settings dict so bidirectional_sync can
-        diff it against the pre-pull local snapshot without a second fetch."""
-        result = SyncResult(peer=peer.name, direction="pull", started_at=_utc_now_iso())
+        diff it against the local snapshot without a second fetch.
+        ``apply_settings=False`` fetches and validates the remote pack but
+        does NOT import it — bidirectional sync is settings-diff-only."""
+        result = SyncResult(peer=peer.name, direction="pull", started_at=utc_now_iso())
         base = peer.base_url
         remote_settings: dict[str, Any] = {}
 
         try:
             status, body, _ = self._http_post_json(f"{base}{ENDPOINTS['settings_export']}", {})
             if 200 <= status < 300:
-                payload = json.loads(body.decode("utf-8", errors="replace")) if body else {}
-                pack = payload.get("pack") if isinstance(payload, dict) else None
-                if isinstance(pack, dict) and pack.get("format") == packs.SETTINGS_PACK_FORMAT:
-                    packs.import_settings_pack(pack)
-                    result.settings = True
-                    if isinstance(pack.get("settings"), dict):
-                        remote_settings = pack["settings"]
+                if self._truncated(body):
+                    result.add_error("settings_export response exceeds size limit")
                 else:
-                    result.add_error("settings_export returned non-pack body")
+                    payload = (
+                        json.loads(body.decode("utf-8", errors="replace"))
+                        if body
+                        else {}
+                    )
+                    pack = payload.get("pack") if isinstance(payload, dict) else None
+                    if (
+                        isinstance(pack, dict)
+                        and pack.get("format") == packs.SETTINGS_PACK_FORMAT
+                    ):
+                        if apply_settings:
+                            packs.import_settings_pack(pack)
+                        result.settings = True
+                        if isinstance(pack.get("settings"), dict):
+                            remote_settings = pack["settings"]
+                    else:
+                        server_err = self._server_error(body)
+                        result.add_error(
+                            server_err or "settings_export returned non-pack body"
+                        )
             else:
                 result.add_error(
-                    f"settings_export HTTP {status}: {body.decode('utf-8', 'replace')[:200]}"
+                    f"settings_export HTTP {status}: {body[:200].decode('utf-8', 'replace')}"
                 )
         except OSError as exc:
             result.add_error(f"settings pull unreachable: {exc}")
@@ -522,85 +677,126 @@ class ContinuitySync:
         try:
             status, body, _ = self._http_post_json(f"{base}{ENDPOINTS['chats_export']}", {})
             if 200 <= status < 300:
-                _manifest, chat_jsons, ndjson = packs.extract_chats_from_zip(body)
-                ctxids = packs.import_chat_jsons(chat_jsons)
-                if ndjson.strip():
-                    # pulled chats get kurultai-indexed locally too —
-                    # continuity means remote chat memory is searchable here.
-                    packs.write_kurultai_ndjson(ndjson)
-                result.chats = True
-                result.chats_imported = len(ctxids)
+                if self._truncated(body):
+                    result.add_error("chats_export response exceeds size limit")
+                elif not body.startswith(b"PK"):
+                    server_err = self._server_error(body)
+                    result.add_error(
+                        server_err or "chats_export returned non-zip body"
+                    )
+                else:
+                    _manifest, chat_jsons, ndjson = packs.extract_chats_from_zip(body)
+                    ctxids = packs.import_chat_jsons(chat_jsons)
+                    result.chats = True
+                    result.chats_imported = len(ctxids)
+                    try:
+                        if ndjson.strip():
+                            # pulled chats get kurultai-indexed locally too —
+                            # continuity means remote chat memory is searchable.
+                            packs.write_kurultai_ndjson(ndjson)
+                    except Exception as exc:
+                        # Inbox write must not retro-fail a completed import.
+                        self._log({"peer": peer.name, "error": f"kurultai inbox: {exc}"})
             else:
                 result.add_error(
-                    f"chats_export HTTP {status}: {body.decode('utf-8', 'replace')[:200]}"
+                    f"chats_export HTTP {status}: {body[:200].decode('utf-8', 'replace')}"
                 )
         except OSError as exc:
             result.add_error(f"chats pull unreachable: {exc}")
         except Exception as exc:
             result.add_error(f"chats pull failed: {exc}")
 
-        try:
-            status, body, _ = self._http_post_json(f"{base}{ENDPOINTS['memory_export']}", {})
-            if 200 <= status < 300:
-                result.atoms_imported = self.import_memory_pack(body)
-                result.memory = True
-            elif status == 404:
-                result.memory = False
-            else:
-                result.add_error(
-                    f"memory_export HTTP {status}: {body.decode('utf-8', 'replace')[:200]}"
+        if getattr(self.backend, "is_null", False):
+            # No memory store on this box — fetching would drop every atom
+            # on the floor while reporting success.
+            result.memory = False
+        else:
+            try:
+                status, body, _ = self._http_post_json(
+                    f"{base}{ENDPOINTS['memory_export']}", {}
                 )
-        except OSError as exc:
-            result.add_error(f"memory pull unreachable: {exc}")
-        except Exception as exc:
-            result.add_error(f"memory pull failed: {exc}")
+                if 200 <= status < 300:
+                    if self._truncated(body):
+                        result.add_error("memory_export response exceeds size limit")
+                    else:
+                        result.atoms_imported = self.import_memory_pack(body)
+                        result.memory = True
+                elif status == 404:
+                    result.memory = False
+                else:
+                    result.add_error(
+                        f"memory_export HTTP {status}: {body[:200].decode('utf-8', 'replace')}"
+                    )
+            except OSError as exc:
+                result.add_error(f"memory pull unreachable: {exc}")
+            except Exception as exc:
+                result.add_error(f"memory pull failed: {exc}")
 
-        result.finished_at = _utc_now_iso()
+        result.finished_at = utc_now_iso()
         self._record_peer_outcome(peer, result)
         return result, remote_settings
 
-    def bidirectional_sync(self, peer: PeerDevice) -> SyncResult:
-        """Push local, pull remote — chats/memory converge by id; settings
-        conflicts are flagged for manual review, never auto-merged.
+    def bidirectional_sync(
+        self,
+        peer: PeerDevice,
+        *,
+        chats_zip: bytes | None = None,
+        memory_ndjson: bytes | None = None,
+    ) -> SyncResult:
+        """Chats/memory converge by id in both directions; settings are
+        DIFF-ONLY — fetched from the peer, compared against local, flagged
+        in ``settings_conflicts`` for manual review. Neither side's
+        settings are written: a bidirectional push would clobber the
+        peer's values before the diff could see them, and a bidirectional
+        apply would be last-write-wins — both violate never-auto-merge.
+        (Pure ``push``/``pull`` directions still apply settings — an
+        explicit direction is the operator's merge decision.)
 
-        The local settings pack is captured BEFORE the pull applies the
-        remote overlay — comparing after would always show zero diffs —
-        and it doubles as the push payload (one build, one remote fetch).
         Runs under the sync lock (internals _push/_pull, so no self-
-        deadlock); a contended call reports failure."""
+        deadlock); a contended call reports failure. Optional prebuilt
+        chats/memory packs skip the per-peer rebuild — the trade: atoms or
+        chats pulled from peer A land in peer B's push next round instead
+        of this one (convergence unchanged, one extra hop)."""
         if not self._sync_lock.acquire(blocking=False):
             result = SyncResult(
-                peer=peer.name, direction="bidirectional", started_at=_utc_now_iso()
+                peer=peer.name, direction="bidirectional", started_at=utc_now_iso()
             )
             result.add_error("another sync is already running")
-            result.finished_at = _utc_now_iso()
+            result.finished_at = utc_now_iso()
             return result
         try:
-            try:
-                local_pack = packs.build_settings_pack()
-            except Exception:
-                local_pack = {}
-            pre_pull_settings = local_pack.get("settings") or {}
-
-            push = self._push(peer, settings_pack=local_pack or None)
-            pull, remote_settings = self._pull(peer)
+            push = self._push(
+                peer,
+                push_settings=False,
+                chats_zip=chats_zip,
+                memory_ndjson=memory_ndjson,
+            )
+            pull, remote_settings = self._pull(peer, apply_settings=False)
 
             result = SyncResult(
                 peer=peer.name, direction="bidirectional", started_at=push.started_at,
             )
-            result.finished_at = _utc_now_iso()
-            result.settings = push.settings and pull.settings
+            result.finished_at = utc_now_iso()
+            result.settings = pull.settings
             result.chats = push.chats or pull.chats
             result.memory = push.memory or pull.memory
-            result.chats_imported = pull.chats_imported
+            result.chats_imported = push.chats_imported + pull.chats_imported
             result.atoms_imported = pull.atoms_imported
             result.errors = push.errors + pull.errors
             if result.errors:
                 result.ok = False
 
-            result.settings_conflicts = self._diff_settings(
-                pre_pull_settings, remote_settings
-            )
+            # Diff only when the remote fetch succeeded — a failed pull
+            # must not fabricate "every key diverged" conflicts.
+            if pull.settings:
+                try:
+                    local_pack = packs.build_settings_pack()
+                    local_settings = local_pack.get("settings") or {}
+                except Exception:
+                    local_settings = {}
+                result.settings_conflicts = self._diff_settings(
+                    local_settings, remote_settings
+                )
             self._record_peer_outcome(peer, result)
             return result
         finally:
@@ -613,9 +809,8 @@ class ContinuitySync:
         """Diff pre-pull local vs remote secret-free settings — differing
         keys only, sensitive keys excluded."""
         conflicts: list[dict[str, Any]] = []
-        sensitive = set(packs.SENSITIVE_SETTINGS_KEYS)
         for key in sorted(set(local_settings) | set(remote_settings)):
-            if key in sensitive:
+            if packs.is_sensitive_key(key):
                 continue
             local_val = local_settings.get(key)
             remote_val = remote_settings.get(key)
@@ -640,11 +835,22 @@ class ContinuitySync:
             iteration += 1
             try:
                 peers = self.discover_peers(force=True)
+                # chats/memory packs are byte-identical across peers in one
+                # round — build once (tens of MB each; N× rebuild is waste).
+                # Settings stays per-peer: it's also the conflict snapshot.
+                try:
+                    chats_zip, _ = packs.build_chats_zip_bytes()
+                    memory_ndjson = self.export_memory_pack()
+                except Exception as exc:
+                    chats_zip, memory_ndjson = None, None
+                    self._log({"error": f"pack prebuild failed: {exc}"})
                 for peer in peers:
                     if stop_event.is_set():
                         return
                     try:
-                        result = self.bidirectional_sync(peer)
+                        result = self.bidirectional_sync(
+                            peer, chats_zip=chats_zip, memory_ndjson=memory_ndjson
+                        )
                         self._log(result.to_dict())
                     except Exception as exc:
                         self._log({"peer": peer.name, "error": str(exc)})
@@ -653,37 +859,46 @@ class ContinuitySync:
 
             if max_iterations is not None and iteration >= max_iterations:
                 break
-            stop_event.wait(interval_seconds)
+            # ±10% jitter — boxes booted together would otherwise sync in
+            # lockstep forever.
+            stop_event.wait(interval_seconds * random.uniform(0.9, 1.1))
 
     def start(self, interval_seconds: int = DEFAULT_SYNC_INTERVAL) -> bool:
         """Start the auto-sync daemon thread. False if already running.
         A fresh Event each start prevents a still-dying previous loop from
         resurrecting on a cleared shared event."""
-        if self._loop_thread is not None and self._loop_thread.is_alive():
-            return False
-        self._loop_stop = threading.Event()
-        self._loop_thread = threading.Thread(
-            target=self.auto_sync_loop,
-            args=(interval_seconds,),
-            name="a0-device-sync",
-            daemon=True,
-        )
-        self._loop_thread.start()
-        return True
+        with self._lifecycle_lock:
+            if self._loop_thread is not None and self._loop_thread.is_alive():
+                return False
+            interval_seconds = max(interval_seconds, MIN_AUTO_SYNC_INTERVAL_S)
+            self._loop_stop = threading.Event()
+            thread = threading.Thread(
+                target=self.auto_sync_loop,
+                args=(interval_seconds,),
+                name="a0-device-sync",
+                daemon=True,
+            )
+            self._loop_thread = thread
+            thread.start()
+            return True
 
     def stop(self) -> bool:
         """Signal the loop to stop and join it briefly (bounded — a stuck
-        peer request must not hang plugin teardown)."""
-        if self._loop_thread is None:
-            return False
-        self._loop_stop.set()
-        thread = self._loop_thread
-        self._loop_thread = None
+        peer request must not hang plugin teardown). Returns True when the
+        thread actually stopped; False when nothing ran or the join timed
+        out (the event stays set — the zombie still exits its next wait)."""
+        with self._lifecycle_lock:
+            thread = self._loop_thread
+            self._loop_thread = None
+            if thread is None:
+                return False
+            self._loop_stop.set()
         thread.join(timeout=min(self.timeout, 10))
         return not thread.is_alive()
 
     def is_running(self) -> bool:
-        return self._loop_thread is not None and self._loop_thread.is_alive()
+        thread = self._loop_thread
+        return thread is not None and thread.is_alive()
 
     # ------------------------------------------------------------------ #
     # status
@@ -691,7 +906,8 @@ class ContinuitySync:
 
     def status(self) -> dict[str, Any]:
         return {
-            "peers": [asdict(p) for p in self._peers.values()],
+            # snapshot — discovery/_record_peer_outcome mutate concurrently
+            "peers": [asdict(p) for p in list(self._peers.values())],
             "peer_count": len(self._peers),
             "auto_sync_running": self.is_running(),
             "memory_backend": type(self.backend).__name__,
@@ -702,7 +918,7 @@ class ContinuitySync:
     # ------------------------------------------------------------------ #
 
     def _record_peer_outcome(self, peer: PeerDevice, result: SyncResult) -> None:
-        peer.last_sync = result.finished_at or _utc_now_iso()
+        peer.last_sync = result.finished_at or utc_now_iso()
         peer.last_sync_status = "success" if result.ok else "failed"
         self._peers[peer.name] = peer
 
@@ -710,13 +926,14 @@ class ContinuitySync:
         """JSON line on stderr — greppable, survives redirection. Conflict
         values stay out of logs (keys only — settings blobs are large and
         re-logged every interval otherwise)."""
-        import sys
-
         safe = dict(payload)
         conflicts = safe.get("settings_conflicts")
         if isinstance(conflicts, list):
             safe["settings_conflicts"] = [
                 c.get("key") for c in conflicts if isinstance(c, dict)
             ]
-        line = json.dumps({"ts": _utc_now_iso(), **safe}, ensure_ascii=False)
-        print(line, file=sys.stderr, flush=True)
+        line = json.dumps({"ts": utc_now_iso(), **safe}, ensure_ascii=False)
+        try:
+            print(line, file=sys.stderr, flush=True)
+        except Exception:
+            pass  # a broken stderr must not kill the auto-sync loop

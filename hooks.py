@@ -13,9 +13,12 @@ import logging
 
 
 def install() -> None:
-    logging.getLogger("a0.device_sync").info(
-        "device-sync plugin installed — engine configures at startup_migration"
-    )
+    try:
+        logging.getLogger("a0.device_sync").info(
+            "device-sync plugin installed — engine configures at startup_migration"
+        )
+    except Exception:
+        pass
 
 
 def uninstall() -> None:

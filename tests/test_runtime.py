@@ -73,7 +73,7 @@ def test_sync_now_named_peer(cfg):
     peer = PeerDevice(name="box", host="10.1.1.1", port=80)
     eng._peers["box"] = peer
     calls = []
-    eng.bidirectional_sync = lambda p: calls.append(p.name) or _r()
+    eng.bidirectional_sync = lambda p, **kw: calls.append(p.name) or _r()
 
     def _r():
         from usr.plugins.device_sync.helpers.sync import SyncResult

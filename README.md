@@ -5,12 +5,19 @@ secret-free settings, chats, and memory atoms between a0 boxes over Tailscale
 (or a manual peers file). Ported from the Khan fork's `device_sync` +
 `continuity_sync` helpers onto stock a0's plugin surface — no upstream edits.
 
+## Install
+
+Drop the repo contents into `usr/plugins/device_sync/` (underscore — the
+directory name is the plugin name, and it is what the imports and the
+`/api/plugins/device_sync/*` routes key on; the repo is `a0-plugin-device-sync`
+but the install path must be `device_sync`).
+
 ## What it syncs
 
 | Pack | Format | Notes |
 |---|---|---|
 | settings | JSON `khan-settings` v1 | secrets scrubbed on export AND dropped on import — local secrets always win |
-| chats | ZIP `khan-chats` v1 | manifest + `chats/<ctxid>.json` + kurultai NDJSON; import dedupes by `ctxid` |
+| chats | ZIP `khan-chats` v1 | manifest + `chats/<ctxid>.json` + kurultai NDJSON; import dedupes by original `ctxid` — **plugin-side** (stock `load_json_chats` deletes `id` and mints fresh ones, so the plugin filters known ids before deserializing) |
 | memory | NDJSON atoms | pluggable backend (`MemoryBackend` protocol); import idempotent by atom `id` |
 
 Pack format tags keep the `khan-` prefix on purpose — a Khan box and a stock-a0
@@ -19,9 +26,15 @@ box running this plugin can sync with each other.
 ## How sync works
 
 Peers are other a0 instances reachable on your Tailscale tailnet. Discovery
-tries `tailscale status --json` first, then `~/.a0-device-sync/peers.json`.
-Each peer is probed on `peer_port` (default 80 — the plugin's endpoints ride
-a0's normal HTTP port). Sync directions: `push`, `pull`, `bidirectional`.
+unions `tailscale status --json` with `~/.a0-device-sync/peers.json`
+(a JSON list of `{"name", "host", "port?"}` — entries with invalid ports
+are skipped, not fatal). Each candidate is probed on `peer_port` (default
+80 — the plugin's endpoints ride a0's normal HTTP port) with an
+**unauthenticated identity check**: the box must answer the peers endpoint
+with the plugin's 403 `forbidden`. A bare open port is not a peer —
+this is what stops a hostile peers-file entry or a non-a0 service from
+receiving your bearer token. Sync directions: `push`, `pull`,
+`bidirectional`.
 
 Endpoints (all POST, all gated by a shared bearer token):
 
@@ -37,9 +50,11 @@ This is machine-to-machine traffic — session auth can't ride a urllib client
 and CSRF is meaningless without cookies, so the handlers declare both off and
 enforce the token themselves. **Empty token = every endpoint refuses.**
 
-Settings never auto-merge in a bidirectional sync — differing keys are
-returned in `settings_conflicts` for manual review. Chats and memory atoms
-converge by idempotent id-based import.
+Settings never auto-merge in a bidirectional sync — it writes settings in
+**neither** direction; differing keys are returned in `settings_conflicts`
+for manual review. (Push and pull still apply settings — those are the
+explicit merge directions.) Chats and memory atoms converge by idempotent
+id-based import.
 
 ## Config
 
@@ -52,6 +67,8 @@ converge by idempotent id-based import.
 - `sync_token` empty by default — required before any endpoint answers.
 - `auto_sync_interval_s: 0` — manual sync only; set e.g. `300` for a
   background thread that bidirectional-syncs every discovered peer.
+  Clamped to a 60s floor, and the loop never starts without a token
+  (it would only produce 403s).
 
 ## Memory backends
 
@@ -81,11 +98,21 @@ your plugin's earlier-numbered `startup_migration` extension).
   per-entry (20 MiB) and total (200 MiB) uncompressed sizes, compression
   ratio guard. Entries are read to memory only — member names never reach
   a filesystem path, so traversal is structurally impossible.
-- Secrets never leave the box: `SENSITIVE_SETTINGS_KEYS` are scrubbed from
-  exports and dropped from imports.
+- Secrets never leave the box: `SENSITIVE_SETTINGS_KEYS` plus
+  pattern-matched capability keys (`mcp_servers`, `*_kwargs`, `*_path`,
+  `*_url`, …) are scrubbed from exports and dropped from imports — a
+  settings overlay can never smuggle in an MCP server spec or a working
+  directory.
+- The HTTP client follows **no redirects** and ignores ambient HTTP
+  proxies — either would forward `Authorization: Bearer` to a host you
+  didn't configure. Responses are read capped at the upload cap + 1.
+- Import endpoints report domain errors in-band as `{"ok": false}` at
+  HTTP 200 (a0 serializes handler dicts); the client checks the envelope,
+  so a rejected pack never reads as a success.
 - Peer failures degrade per-step: one unreachable endpoint fails that pack
   type, not the whole sync; a 404 memory endpoint = "peer doesn't support
-  memory yet", not an error.
+  memory yet", not an error. A contended manual/auto sync reports busy
+  instead of queueing.
 
 ## Tests
 
@@ -95,10 +122,22 @@ python -m pytest tests/ -q
 
 No external services needed — the HTTP seam is stubbed in tests.
 
+## State the plugin doesn't own
+
+- `~/.a0-device-sync/` — peers file, sync log/state. Survives uninstall on
+  purpose; delete manually to forget everything.
+- `usr/kurultai-inbox/chats/` — kurultai NDJSON pulled from peers is
+  dropped here for the host's own ingestion path.
+- `hooks.py uninstall` stops the auto-sync thread and unregisters memory
+  backends; it does not delete either directory.
+
 ## Status / limits
 
-- Peer detection is a TCP probe on `peer_port` — it proves "something
-  answers", and sync calls then validate by pack format.
+- Peer detection is an HTTP identity probe (see above) — it proves "an a0
+  with this plugin answers", not just "a port is open".
 - No pack encryption — the threat model is tailnet transport security plus
   the shared token. Secrets don't cross the wire regardless.
 - Settings conflict resolution is manual by design.
+- Chat dedupe preserves the *origin* ctxid — which means a chat synced
+  A→B→A is recognized as the same chat (good), and two genuinely distinct
+  local chats can never share a ctxid because a0 assigns ids.

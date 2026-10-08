@@ -8,6 +8,8 @@ skipped, so re-delivery is safe.
 
 from __future__ import annotations
 
+import asyncio
+
 from helpers.api import ApiHandler
 
 from usr.plugins.device_sync.helpers.auth import PeerEndpoint
@@ -23,10 +25,13 @@ class MemoryImport(PeerEndpoint, ApiHandler):
         sync = runtime.engine()
         if sync is None:
             return {"ok": False, "error": "device-sync inactive"}
+        length = getattr(request, "content_length", None)
+        if length is not None and length > packs.MAX_PACK_UPLOAD_BYTES:
+            return {"ok": False, "error": "memory pack exceeds the upload cap"}
         raw = request.get_data()
         try:
             packs.assert_upload_size(raw, label="memory pack")
-            imported = sync.import_memory_pack(raw)
+            imported = await asyncio.to_thread(sync.import_memory_pack, raw)
             return {"ok": True, "imported": imported}
         except Exception as e:
             return {"ok": False, "error": auth.safe_error(e)}

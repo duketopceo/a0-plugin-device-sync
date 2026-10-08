@@ -8,6 +8,8 @@ a0 persistence/notification path runs.
 
 from __future__ import annotations
 
+import asyncio
+
 from helpers.api import ApiHandler
 
 from usr.plugins.device_sync.helpers.auth import PeerEndpoint
@@ -23,7 +25,7 @@ class SettingsImport(PeerEndpoint, ApiHandler):
         if not isinstance(input, dict) or not isinstance(input.get("pack"), dict):
             return {"ok": False, "error": "object body with 'pack' required"}
         try:
-            packs.import_settings_pack(input["pack"])
+            await asyncio.to_thread(packs.import_settings_pack, input["pack"])
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": auth.safe_error(e)}

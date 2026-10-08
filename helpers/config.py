@@ -92,14 +92,19 @@ def _merge_env(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _parse(raw: dict[str, Any]) -> SyncConfig:
+    interval = _as_int(
+        raw.get("auto_sync_interval_s"), _DEFAULTS.auto_sync_interval_s
+    )
+    if 0 < interval < 60:
+        # a sub-minute interval is a retry storm (tailscale subprocess +
+        # probes + full pack exchange per peer per tick) — floor it.
+        interval = 60
     return SyncConfig(
         enabled=_as_bool(raw.get("enabled"), _DEFAULTS.enabled),
         sync_token=str(raw.get("sync_token") or _DEFAULTS.sync_token),
         peers_file=str(raw.get("peers_file") or _DEFAULTS.peers_file),
-        peer_port=_as_int(raw.get("peer_port"), _DEFAULTS.peer_port, minimum=1),
-        auto_sync_interval_s=_as_int(
-            raw.get("auto_sync_interval_s"), _DEFAULTS.auto_sync_interval_s
-        ),
+        peer_port=min(65535, _as_int(raw.get("peer_port"), _DEFAULTS.peer_port, minimum=1)),
+        auto_sync_interval_s=interval,
         http_timeout_s=_as_float(
             raw.get("http_timeout_s"), _DEFAULTS.http_timeout_s, minimum=1.0
         ),

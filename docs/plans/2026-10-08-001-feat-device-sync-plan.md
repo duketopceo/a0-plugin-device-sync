@@ -22,8 +22,10 @@ fills the gap — settings/chats/memory packs moving between a0 boxes.
 - **Memory is a pluggable backend, not a horde port.** Khan couples to
   `horde.memory.store.MemoryAtomStore`; a0 has no such thing. The plugin
   defines `MemoryBackend` (export_atoms/import_atoms/has_atom) with two
-  shipped impls: `null` (default — memory packs report unsupported, peer
-  sees the 404-equivalent path Khan already handles) and `git` (the
+  shipped impls: `null` (default — memory packs report unsupported;
+  shipped divergence: export returns an empty-200 NDJSON body and pull
+  skips the fetch entirely via `backend.is_null` — same graceful outcome
+  as the planned 404-equivalent, without a fake 404) and `git` (the
   issue's MemFS-style option — the atoms dir IS a git repo: sync =
   commit+pull+push, backup/diff/rollback free). Kurultai (#200) can
   register the real store later via `runtime.register_memory_backend`.
@@ -53,6 +55,9 @@ api/                      8 handlers: settings_export/import,
                           sync_now, peers (status folded into peers)
 extensions/python/startup_migration/_70_device_sync_init.py  configure+start
 hooks.py                  install log-only; uninstall stops the loop thread
+                          AND unregisters memory backends (shipped addition —
+                          a backend holding a registered name would leak
+                          across plugin reloads)
 ```
 
 ## Acceptance mapping

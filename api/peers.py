@@ -8,6 +8,8 @@ bookkeeping plus engine status. "peers" is the fresh discovered view;
 
 from __future__ import annotations
 
+import asyncio
+
 from helpers.api import ApiHandler
 
 from usr.plugins.device_sync.helpers.auth import PeerEndpoint
@@ -20,4 +22,7 @@ class Peers(PeerEndpoint, ApiHandler):
         denial = self.deny(request)
         if denial is not None:
             return denial
-        return {"ok": True, "peers": runtime.peers(), "status": runtime.status()}
+        # discovery runs tailscale subprocess + per-peer probes — offload
+        return await asyncio.to_thread(
+            lambda: {"ok": True, "peers": runtime.peers(), "status": runtime.status()}
+        )
