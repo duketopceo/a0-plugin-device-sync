@@ -1,0 +1,31 @@
+# NOTICE
+
+This repository (**a0-plugin-device-sync**, `duketopceo/a0-plugin-device-sync`)
+is a plugin for [Agent Zero](https://github.com/agent0ai/agent-zero).
+
+## Upstream
+
+Agent Zero is licensed under the MIT License by **Agent Zero, s.r.o**
+(contact: pr@agent-zero.ai). No upstream source files are vendored here, but
+this plugin targets Agent Zero's plugin APIs and adapts patterns from it.
+
+## Provenance
+
+- The pack machinery (`helpers/packs.py`) and the transport engine
+  (`helpers/sync.py`) are ports of the Khan fork's `helpers/device_sync.py`
+  and `helpers/continuity_sync.py`
+  (https://github.com/duketopceo/khan), itself MIT-licensed work by
+  Luke Kimball / duketopceo.
+- Khan's memory packs rode `horde.memory.MemoryAtomStore`; this plugin
+  replaces that coupling with a pluggable `MemoryBackend` protocol plus a
+  MemFS-style `git` backend (atom store = a git repo of JSON files).
+- Peer endpoints moved under `/api/plugins/device_sync/*` and peer auth is
+  a shared bearer token instead of session auth — machine-to-machine sync
+  can't ride browser credentials.
+
+## This plugin
+
+Original work here is Copyright (c) 2026 Luke Kimball / duketopceo, released
+under the MIT terms in `LICENSE`.
+
+Preserve the upstream copyright notice and this NOTICE when redistributing.

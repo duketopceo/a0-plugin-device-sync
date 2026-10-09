@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.codebase-memory/
+data/
+*.db
+*.db-wal
+*.db-shm
+.pytest_cache/
+.venv/
+.devin/
+.DS_Store

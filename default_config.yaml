@@ -1,0 +1,38 @@
+# a0-plugin-device-sync — defaults. a0 deep-merges this under the plugin's
+# config; every key is overridable by the matching DEVICE_SYNC_* env var.
+
+# Master switch — the plugin is fully inert until enabled.
+enabled: false
+
+# Shared secret peers present as `Authorization: Bearer <token>` (or
+# X-Device-Sync-Token) on every sync endpoint. EMPTY = sync endpoints
+# refuse all traffic (secure default — no token, no sync surface).
+# Prefer env: DEVICE_SYNC_TOKEN.
+sync_token: ""
+
+# Peer discovery: `tailscale status --json` first, then this file
+# (JSON list of {name, host, port?, ts_hostname?}). Empty = default path
+# ~/.a0-device-sync/peers.json.
+peers_file: ""
+
+# Port peers are probed/served on (this a0 instance's HTTP port — the
+# sync endpoints are /api/plugins/device_sync/* on the normal app port).
+peer_port: 80
+
+# Auto-sync daemon: bidirectional sync with every discovered peer on this
+# cadence. 0 disables the background loop entirely (manual sync via the
+# sync_now endpoint still works).
+auto_sync_interval_s: 0
+
+# HTTP timeout for pack transfers (settings/chats/memory can be MBs).
+http_timeout_s: 60
+
+# Memory pack backend: "none" (default — memory sync reports unsupported,
+# same as a peer without memory endpoints) or "git" (the atoms dir is a
+# git repo — import commits; sync can push/pull. MemFS-style: backup,
+# diff and rollback come free).
+memory_backend: "none"
+
+# For memory_backend=git: repo path for the atom store. Empty defaults to
+# the plugin's own data dir (usr/plugins/device_sync/data/memory-atoms).
+memory_dir: ""

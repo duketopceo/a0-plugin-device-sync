@@ -1,0 +1,10 @@
+name: device_sync
+title: Device Sync
+description: >-
+  Cross-instance sync packs for Agent Zero — secret-free settings, chats,
+  and memory atoms between a0 boxes over Tailscale (or a manual peer list).
+version: 0.1.0
+per_project_config: false
+per_agent_config: false
+settings_sections:
+  - external
