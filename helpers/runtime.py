@@ -108,6 +108,18 @@ def token_ok(token: str | None) -> bool:
         return False
 
 
+def hmac_proof(nonce: str) -> str:
+    """HMAC-SHA256(configured_token, nonce) for the identity probe — proves
+    token possession to an unauthenticated caller without exposing it.
+    Empty when no token is configured (nothing to prove)."""
+    from usr.plugins.device_sync.helpers import auth
+
+    token = _cfg.sync_token if _cfg else ""
+    if not token or not nonce:
+        return ""
+    return auth.peer_proof(nonce, token)
+
+
 def sync_now(peer: str | None = None, direction: str = "bidirectional") -> dict[str, Any]:
     """Manual sync trigger. ``peer`` names one peer; None = all discovered."""
     sync = _sync

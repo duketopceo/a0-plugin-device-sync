@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import io
 import sys
 import types
 from pathlib import Path
@@ -109,7 +110,7 @@ class _Headers(dict):
 
 
 class FakeRequest:
-    """werkzeug Request stand-in: headers dict + raw body."""
+    """werkzeug Request stand-in: headers dict + raw body + stream."""
 
     def __init__(self, path="/api/x", method="POST", headers=None, data=b""):
         self.path = path
@@ -117,6 +118,7 @@ class FakeRequest:
         self.headers = _Headers(headers or {})
         self._data = data
         self.content_length = len(data)
+        self.stream = io.BytesIO(data)  # werkzeug exposes the body as .stream
 
     def get_data(self):
         return self._data
@@ -190,6 +192,7 @@ def _saved_chat_ids():
 
 class AgentContextType:
     USER = "user"
+    TASK = "task"  # matches agent.AgentContextType — subagent chats
     BACKGROUND = "background"
 
 

@@ -345,3 +345,68 @@ def test_send_temp_file_cleans_up(tmp_path):
     assert resp.get_data() == b"zip"
     resp.close()
     assert not p.exists()
+
+
+def test_import_rejects_traversal_and_weird_ids(chats_store):
+    """A pack chat's id crosses into filesystem paths (get_chat_folder_path,
+    remove_chat's delete_dir) — anything outside [A-Za-z0-9_-]{1,128} is
+    rejected whole, never sanitized-and-imported."""
+    hostile = [
+        _mk_chat("../../etc/cron.d/x"),
+        _mk_chat("../out"),
+        _mk_chat("a/b"),
+        _mk_chat("a.b"),   # dot rejected too — no suffix games
+        _mk_chat(""),
+        _mk_chat("x" * 200),
+    ]
+    assert packs.import_chat_jsons(hostile) == []
+    assert list(chats_store) == []
+
+
+def test_import_scrubs_agent_profile(chats_store, monkeypatch):
+    """agent_profile feeds initialize_agent(override_settings=...) on
+    deserialize — a pack-chosen profile is a settings/prompt injection.
+    Top-level AND per-agent fields are dropped; the chat imports under the
+    default profile."""
+    from helpers import persist_chat
+
+    captured = {}
+    real = persist_chat._deserialize_context
+
+    def spy(data):
+        captured["data"] = json.loads(json.dumps(data))
+        return real(data)
+
+    monkeypatch.setattr(persist_chat, "_deserialize_context", spy)
+
+    chat = json.dumps({
+        "id": "okchat1",
+        "name": "x",
+        "agent_profile": "evil-profile",
+        "agents": [
+            {"number": 0, "agent_profile": "evil-profile", "data": {},
+             "history": ""},
+            {"number": 1, "data": {}, "history": ""},
+        ],
+        "log": {"logs": []},
+    })
+    assert packs.import_chat_jsons([chat]) == ["okchat1"]
+    stored = captured["data"]
+    assert "agent_profile" not in stored
+    assert "agent_profile" not in stored["agents"][0]
+
+
+def test_export_excludes_task_and_background(chats_store):
+    """Only USER chats sync — TASK (subagent) transcripts can carry delegated
+    work the owner never reviewed; BACKGROUND is housekeeping."""
+    from agent import AgentContext, AgentContextType
+
+    AgentContext("u1", AgentContextType.USER)
+    AgentContext("t1", AgentContextType.TASK)
+    AgentContext("b1", AgentContextType.BACKGROUND)
+    chats_store["u1"] = _mk_chat("u1")
+    chats_store["t1"] = _mk_chat("t1")
+    chats_store["b1"] = _mk_chat("b1")
+
+    pairs = packs.collect_exportable_chat_jsons()
+    assert [cid for cid, _ in pairs] == ["u1"]

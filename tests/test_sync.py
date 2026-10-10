@@ -286,24 +286,70 @@ def test_peers_file_bad_port_skipped_not_fatal(tmp_path):
     assert [p.name for p in sync.discover_peers()] == ["good"]
 
 
-def test_is_peer_requires_forbidden_signature(tmp_path):
-    """Identity probe: unauthenticated POST must yield the plugin's 403
-    'forbidden' — a bare open port is NOT a peer (token-theft guard)."""
+def test_is_peer_requires_hmac_proof(tmp_path):
+    """Identity probe: unauthenticated POST carries a nonce; the peer must
+    return 403 + HMAC(token, nonce). A bare 403 'forbidden' is forgeable —
+    a hostile port could harvest the bearer + every pack otherwise."""
     import urllib.error
 
-    sync = _mk_sync(tmp_path)
+    sync = _mk_sync(tmp_path)  # token="tok"
     peer = _peer()
 
     class RealPluginPeer:
         def open(self, req, timeout=None):
-            assert not dict(req.header_items()).get("authorization")
+            headers = dict(req.header_items())
+            assert not headers.get("authorization")
+            nonce = headers.get("X-device-sync-nonce") or headers.get(
+                "X-Device-Sync-Nonce")
+            assert nonce  # challenge must be presented
+            from usr.plugins.device_sync.helpers import auth
+
+            proof = auth.peer_proof(nonce, "tok")
+            raise urllib.error.HTTPError(
+                req.full_url, 403, "Forbidden", {},
+                io.BytesIO(
+                    json.dumps(
+                        {"ok": False, "error": "forbidden", "proof": proof}
+                    ).encode()
+                ),
+            )
+
+    sync._opener = RealPluginPeer()
+    assert sync._is_peer(peer) is True
+
+    class Forgeable403:
+        """The OLD signature — a static forbidden body any port can mint."""
+
+        def open(self, req, timeout=None):
             raise urllib.error.HTTPError(
                 req.full_url, 403, "Forbidden", {},
                 io.BytesIO(b'{"ok": false, "error": "forbidden"}'),
             )
 
-    sync._opener = RealPluginPeer()
-    assert sync._is_peer(peer) is True
+    sync._opener = Forgeable403()
+    assert sync._is_peer(peer) is False
+
+    class WrongProof:
+        """A peer with a DIFFERENT token can't pass as ours."""
+
+        def open(self, req, timeout=None):
+            headers = dict(req.header_items())
+            nonce = headers.get("X-device-sync-nonce") or headers.get(
+                "X-Device-Sync-Nonce") or "x"
+            from usr.plugins.device_sync.helpers import auth
+
+            proof = auth.peer_proof(nonce, "attacker-token")
+            raise urllib.error.HTTPError(
+                req.full_url, 403, "Forbidden", {},
+                io.BytesIO(
+                    json.dumps(
+                        {"ok": False, "error": "forbidden", "proof": proof}
+                    ).encode()
+                ),
+            )
+
+    sync._opener = WrongProof()
+    assert sync._is_peer(peer) is False
 
     class RandomService:
         def open(self, req, timeout=None):
@@ -327,6 +373,12 @@ def test_is_peer_requires_forbidden_signature(tmp_path):
 
     sync._opener = Dead()
     assert sync._is_peer(peer) is False
+
+
+def test_is_peer_no_token_never_proves(tmp_path):
+    """No configured token -> nothing to verify against -> not a peer."""
+    sync = _mk_sync(tmp_path, token="")
+    assert sync._is_peer(_peer()) is False
 
 
 def test_sync_lock_contention_reports_busy(tmp_path):

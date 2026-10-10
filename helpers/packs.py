@@ -25,6 +25,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import tempfile
 import zipfile
 from datetime import datetime, timezone
@@ -256,7 +257,9 @@ def validate_kurultai_ndjson(ndjson: str) -> int:
 
 
 def collect_exportable_chat_jsons(ctxids: list[str] | None = None) -> list[tuple[str, str]]:
-    """Return [(ctxid, json_string), ...] for USER chats (not BACKGROUND)."""
+    """Return [(ctxid, json_string), ...] for USER chats only — BACKGROUND
+    housekeeping and TASK (subagent) chats stay local: a task's transcript
+    can carry delegated work the owner never reviewed."""
     from agent import AgentContext, AgentContextType
     from helpers import persist_chat
 
@@ -264,7 +267,7 @@ def collect_exportable_chat_jsons(ctxids: list[str] | None = None) -> list[tuple
     wanted = set(ctxids) if ctxids else None
     out: list[tuple[str, str]] = []
     for context in AgentContext.all():
-        if context.type == AgentContextType.BACKGROUND:
+        if context.type != AgentContextType.USER:
             continue
         if wanted is not None and context.id not in wanted:
             continue
@@ -411,6 +414,29 @@ def extract_chats_from_zip(zip_bytes: bytes) -> tuple[dict[str, Any], list[str],
     return manifest, chat_jsons, ndjson
 
 
+# ctxid allowlist — the id crosses the plugin->host trust boundary: it
+# becomes a filesystem path in get_chat_folder_path()/save_tmp_chat() and a
+# delete_dir() target in remove_chat(). a0 ids are 8-char alnum; -_ allowed
+# for other sources. Anything else (/, ., \0, traversal) is skipped, not
+# sanitized — a pack chat with a hostile id is rejected whole.
+_CHAT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+
+
+def _scrub_agent_profile(data: dict[str, Any]) -> None:
+    """Drop agent_profile from an imported chat — _deserialize_context and
+    _deserialize_agent_config feed it to initialize_agent(override_settings=
+    {"agent_profile": ...}), and an attacker-chosen profile is a settings/
+    prompt injection across the trust boundary (the same reason it's a
+    SENSITIVE_SETTINGS_KEYS entry). Imported chats land on the default
+    profile."""
+    data.pop("agent_profile", None)
+    agents = data.get("agents")
+    if isinstance(agents, list):
+        for ag in agents:
+            if isinstance(ag, dict):
+                ag.pop("agent_profile", None)
+
+
 def import_chat_jsons(chat_jsons: list[str]) -> list[str]:
     """Import chat JSONs with real ctxid dedupe — returns imported ctxids.
 
@@ -447,7 +473,10 @@ def import_chat_jsons(chat_jsons: list[str]) -> list[str]:
         if not isinstance(data, dict):
             continue
         cid = str(data.get("id") or "")
-        if cid and cid not in known:
+        if not _CHAT_ID_RE.fullmatch(cid):
+            continue  # id becomes a filesystem path downstream — allowlist or skip
+        if cid not in known:
+            _scrub_agent_profile(data)
             novel.append((js, data))
             known.add(cid)
 
