@@ -141,6 +141,10 @@ def _get_settings():
 
 
 def _set_settings(new):
+    # Host set_settings() runs normalize_settings: keys not in the default
+    # schema are DROPPED and missing defaults backfilled. This stub can't
+    # model the schema — tests must not assert that imported foreign keys
+    # persist (they survive here but not on the real host).
     _settings_state.clear()
     _settings_state.update(new)
     return dict(_settings_state)
