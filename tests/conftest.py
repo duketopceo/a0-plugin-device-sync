@@ -22,6 +22,7 @@ import json
 import io
 import sys
 import types
+from enum import Enum
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -190,7 +191,7 @@ def _saved_chat_ids():
     return set(_chats_store)
 
 
-class AgentContextType:
+class AgentContextType(Enum):
     USER = "user"
     TASK = "task"  # matches agent.AgentContextType — subagent chats
     BACKGROUND = "background"
