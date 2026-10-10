@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import io
 import sys
 import types
+from enum import Enum
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -109,7 +111,7 @@ class _Headers(dict):
 
 
 class FakeRequest:
-    """werkzeug Request stand-in: headers dict + raw body."""
+    """werkzeug Request stand-in: headers dict + raw body + stream."""
 
     def __init__(self, path="/api/x", method="POST", headers=None, data=b""):
         self.path = path
@@ -117,6 +119,7 @@ class FakeRequest:
         self.headers = _Headers(headers or {})
         self._data = data
         self.content_length = len(data)
+        self.stream = io.BytesIO(data)  # werkzeug exposes the body as .stream
 
     def get_data(self):
         return self._data
@@ -138,6 +141,10 @@ def _get_settings():
 
 
 def _set_settings(new):
+    # Host set_settings() runs normalize_settings: keys not in the default
+    # schema are DROPPED and missing defaults backfilled. This stub can't
+    # model the schema — tests must not assert that imported foreign keys
+    # persist (they survive here but not on the real host).
     _settings_state.clear()
     _settings_state.update(new)
     return dict(_settings_state)
@@ -188,8 +195,9 @@ def _saved_chat_ids():
     return set(_chats_store)
 
 
-class AgentContextType:
+class AgentContextType(Enum):
     USER = "user"
+    TASK = "task"  # matches agent.AgentContextType — subagent chats
     BACKGROUND = "background"
 
 

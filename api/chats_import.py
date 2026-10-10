@@ -30,10 +30,12 @@ class ChatsImport(PeerEndpoint, ApiHandler):
         # Reject oversized uploads BEFORE buffering the body — a0 reads
         # request.data for JSON bodies pre-auth, but raw posts arrive here
         # unread; don't materialize a multi-GB body just to refuse it.
-        length = getattr(request, "content_length", None)
-        if length is not None and length > packs.MAX_PACK_UPLOAD_BYTES:
+        # Content-Length is advisory (absent under chunked, or lying), so
+        # the stream itself is bounded.
+        try:
+            raw = auth.read_body_capped(request, packs.MAX_PACK_UPLOAD_BYTES)
+        except ValueError:
             return {"ok": False, "error": "chats pack exceeds the upload cap"}
-        raw = request.get_data()
 
         def _import():
             _manifest, chat_jsons, ndjson = packs.extract_chats_from_zip(raw)

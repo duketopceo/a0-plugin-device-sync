@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import random
+import secrets
 import shutil
 import subprocess
 import sys
@@ -42,7 +43,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from usr.plugins.device_sync.helpers import packs
+from usr.plugins.device_sync.helpers import auth, packs
 from usr.plugins.device_sync.helpers.memory_backend import MemoryBackend, NullMemoryBackend
 
 __all__ = [
@@ -450,18 +451,31 @@ class ContinuitySync:
         return out
 
     def _is_peer(self, peer: PeerDevice) -> bool:
-        """Identity probe — POST the peers endpoint WITHOUT credentials and
-        require the plugin's 403 {"ok": false, "forbidden"} signature. A
-        bare TCP check only proves SOMETHING answers on the port — without
-        identity verification, every listening device on the tailnet
-        (including shared-in and compromised devices) would receive the
-        bearer token and full packs on the next sync."""
+        """Identity probe — POST the peers endpoint WITHOUT credentials but
+        WITH a fresh nonce challenge, and require the plugin's 403 carrying
+        a valid HMAC proof of the shared token. A bare TCP check proves
+        SOMETHING answers; a static 403 body proves only that the port can
+        shape JSON — proof-of-token is the one signature a hostile port
+        can't mint. Without it, every listening device on the tailnet
+        (shared-in, compromised) would receive the bearer + full packs.
+
+        Residual: an attacker relaying through a REAL peer can proxy the
+        challenge — this proves "the endpoint shares the token", not "the
+        endpoint is the claimed host". Tailscale ACLs + HTTPS are the
+        complete answer."""
+        if not self.token:
+            return False  # nothing to verify identity against
+        nonce = secrets.token_hex(16)
         url = f"{peer.base_url}/api/plugins/device_sync/peers"
         req = urllib.request.Request(
             url,
             data=b"{}",
             method="POST",
-            headers={"Content-Type": "application/json", "User-Agent": _UA},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": _UA,
+                auth.NONCE_HEADER: nonce,
+            },
         )
         try:
             resp = self._opener.open(req, timeout=PEER_PROBE_TIMEOUT)
@@ -472,7 +486,18 @@ class ContinuitySync:
                 body = exc.read(4096)
             finally:
                 exc.close()
-            return exc.code == 403 and b"forbidden" in body
+            if exc.code != 403:
+                return False
+            try:
+                payload = json.loads(body)
+            except (ValueError, TypeError):
+                return False
+            proof = str(payload.get("proof") or "")
+            if not proof:
+                return False
+            return secrets.compare_digest(
+                proof, auth.peer_proof(nonce, self.token)
+            )
         except Exception:
             return False
 
@@ -823,13 +848,19 @@ class ContinuitySync:
     # ------------------------------------------------------------------ #
 
     def auto_sync_loop(
-        self, interval_seconds: int = DEFAULT_SYNC_INTERVAL, *, max_iterations: int | None = None
+        self,
+        interval_seconds: int = DEFAULT_SYNC_INTERVAL,
+        stop_event: threading.Event | None = None,
+        *,
+        max_iterations: int | None = None,
     ) -> None:
         """Discover peers, bidirectional-sync every interval, until stop().
         Sync is blocking urllib work on its own thread — the host job loop
-        never waits on it. The stop event is captured once so a later
-        start() (fresh Event) can't revive an orphaned loop."""
-        stop_event = self._loop_stop
+        never waits on it. The stop event is bound BY start() at spawn —
+        re-reading self._loop_stop here is a TOCTOU: a stop()+start()
+        landing between spawn and capture would bind this loop to the NEW
+        event, overlapping two daemons until the next stop()."""
+        stop_event = stop_event if stop_event is not None else self._loop_stop
         iteration = 0
         while not stop_event.is_set():
             iteration += 1
@@ -874,7 +905,7 @@ class ContinuitySync:
             self._loop_stop = threading.Event()
             thread = threading.Thread(
                 target=self.auto_sync_loop,
-                args=(interval_seconds,),
+                args=(interval_seconds, self._loop_stop),
                 name="a0-device-sync",
                 daemon=True,
             )

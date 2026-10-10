@@ -56,8 +56,13 @@ Cross-instance sync plugin for stock Agent Zero (Khan `device_sync` +
 - **In-band errors**: import endpoints return `{"ok": false}` at HTTP 200;
   `_import_response_ok` requires `ok is True` or the leg fails.
 - **Transport trust**: `_opener` refuses redirects and ambient proxies
-  (bearer-token leak sinks); responses read capped at cap+1; `_is_peer`
-  demands the 403-`forbidden` signature, not an open port.
+  (bearer-token leak sinks); response bodies bounded on the stream, not
+  Content-Length (absent under chunked, or lying); `_is_peer` demands an
+  HMAC proof of the shared token over a fresh nonce — a static 403 body
+  is forgeable and any tailnet port could harvest the bearer + packs.
+  Pre-HMAC peers fail the probe (treated as unreachable). Residual: a
+  relay through a REAL peer can proxy the challenge — proof means
+  "shares the token", not "is the claimed host".
 - **Lifecycle**: `start`/`stop` under `_lifecycle_lock`; a `stop` landing
   mid-`start` still wins; captured stop event means a later `start` can't
   revive an orphaned loop. No token → no loop. `runtime.configure`

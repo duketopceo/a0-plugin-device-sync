@@ -203,3 +203,50 @@ def test_sync_now_endpoint(active):
     eng._run_tailscale_status = lambda: {}
     out = run(sync_now.SyncNow().process({"direction": "push"}, _req("test-token")))
     assert out["ok"] is True and out["results"] == []
+
+
+# --------------------------- peer proof -------------------------------------
+
+
+def test_forbidden_includes_hmac_proof_with_nonce(active):
+    """The identity probe's server half: a failed-auth POST carrying
+    X-Device-Sync-Nonce gets a 403 whose proof field proves shared-token
+    possession — the probe never sends the token itself."""
+    from usr.plugins.device_sync.api import peers
+    from usr.plugins.device_sync.helpers import auth
+
+    req = FakeRequest(headers={"X-Device-Sync-Nonce": "abc123"})
+    r = run(peers.Peers().process({}, req))
+    assert r.status == 403
+    body = json.loads(r.get_data())
+    assert body["ok"] is False and "forbidden" in body["error"]
+    assert body["proof"] == auth.peer_proof("abc123", "test-token")
+
+
+def test_forbidden_has_no_proof_without_nonce(active, anon_request):
+    from usr.plugins.device_sync.api import peers
+
+    r = run(peers.Peers().process({}, anon_request))
+    body = json.loads(r.get_data())
+    assert "proof" not in body
+
+
+# --------------------------- upload cap --------------------------------------
+
+
+def test_chunked_body_capped_on_stream(active, monkeypatch):
+    """Content-Length=None (chunked) must not skip the cap — the body is
+    bounded on the stream, not the header."""
+    from usr.plugins.device_sync.api import chats_import, memory_import
+    from usr.plugins.device_sync.helpers import packs
+
+    monkeypatch.setattr(packs, "MAX_PACK_UPLOAD_BYTES", 64)
+    req = _req("test-token", b"x" * 100)
+    req.content_length = None  # simulate chunked encoding
+    out = run(chats_import.ChatsImport().process({}, req))
+    assert out["ok"] is False and "cap" in out["error"]
+
+    req2 = _req("test-token", b"x" * 100)
+    req2.content_length = None
+    out2 = run(memory_import.MemoryImport().process({}, req2))
+    assert out2["ok"] is False and "cap" in out2["error"]
