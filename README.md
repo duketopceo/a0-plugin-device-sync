@@ -1,16 +1,38 @@
-# a0-plugin-device-sync
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/wordmark-dark.svg">
+    <img alt="a0-plugin-device-sync" src="assets/brand/wordmark.svg" width="520">
+  </picture>
+</p>
 
-Cross-instance sync packs for [Agent Zero](https://github.com/agent0ai/agent-zero):
-secret-free settings, chats, and memory atoms between a0 boxes over Tailscale
-(or a manual peers file). Ported from the Khan fork's `device_sync` +
-`continuity_sync` helpers onto stock a0's plugin surface — no upstream edits.
+Move secret-free settings, chats and memory atoms between your own [Agent Zero](https://github.com/agent0ai/agent-zero) instances over Tailscale or a manual peers list.
+
+Status: 0.1.0, disabled by default, single operator, stdlib only. Roadmap: [ROADMAP.md](ROADMAP.md). Logo and design are proposals ([DESIGN.md](DESIGN.md)).
+
+<!-- TODO: screenshot of the settings panel from a running a0 -->
+
+Ported from the Khan fork's `device_sync` and `continuity_sync` helpers onto stock a0's plugin surface, with no upstream edits.
 
 ## Install
 
-Drop the repo contents into `usr/plugins/device_sync/` (underscore — the
-directory name is the plugin name, and it is what the imports and the
-`/api/plugins/device_sync/*` routes key on; the repo is `a0-plugin-device-sync`
-but the install path must be `device_sync`).
+Drop the repo contents into `usr/plugins/device_sync/` (underscore). The directory name is the plugin name and is what the imports and the `/api/plugins/device_sync/*` routes key on; the repo is `a0-plugin-device-sync` but the install path must be `device_sync`.
+
+## Quick start
+
+1. Set a shared token on every box (same value): `DEVICE_SYNC_TOKEN=<secret>`.
+2. Set `DEVICE_SYNC_ENABLED=true` (or `enabled: true` in the plugin config).
+3. Make peers reachable: on one tailnet they are discovered via `tailscale status --json`; otherwise list them in `~/.a0-device-sync/peers.json` as `[{"name": "...", "host": "...", "port": 80}]`.
+4. Trigger a sync: POST `/api/plugins/device_sync/sync_now` with `{"peer": "<name>", "direction": "push" | "pull" | "bidirectional"}` and the header `Authorization: Bearer <token>`. Omit `peer` to sync every discovered peer.
+5. Optional: `auto_sync_interval_s: 300` for a background bidirectional sync (60 s floor, never starts without a token).
+
+## How it works
+
+```mermaid
+flowchart LR
+  A[a0 box A<br/>packs.py] <-- "HTTP POST + bearer token<br/>settings / chats / memory packs" --> B[a0 box B<br/>packs.py]
+  T[tailscale status --json<br/>+ peers.json] --> A
+  A -. "HMAC nonce probe<br/>before any token is sent" .-> B
+```
 
 ## What it syncs
 
@@ -30,10 +52,13 @@ unions `tailscale status --json` with `~/.a0-device-sync/peers.json`
 (a JSON list of `{"name", "host", "port?"}` — entries with invalid ports
 are skipped, not fatal). Each candidate is probed on `peer_port` (default
 80 — the plugin's endpoints ride a0's normal HTTP port) with an
-**unauthenticated identity check**: the box must answer the peers endpoint
-with the plugin's 403 `forbidden`. A bare open port is not a peer —
-this is what stops a hostile peers-file entry or a non-a0 service from
-receiving your bearer token. Sync directions: `push`, `pull`,
+**identity probe**: an unauthenticated request carrying a fresh nonce
+(`X-Device-Sync-Nonce`); the box must answer 403 with an HMAC-SHA256 proof
+of the shared token over that nonce. A bare open port is not a peer, and the
+token itself never rides the probe, so a hostile peers-file entry or a
+non-a0 service cannot harvest it. The proof shows the peer shares the
+token, not that it is the host you meant: a relay through a real peer can
+answer the challenge. Sync directions: `push`, `pull`,
 `bidirectional`.
 
 Endpoints (all POST, all gated by a shared bearer token):
@@ -57,6 +82,19 @@ explicit merge directions.) Chats and memory atoms converge by idempotent
 id-based import.
 
 ## Config
+
+| Key | Default | Env | Meaning |
+|---|---|---|---|
+| `enabled` | `false` | `DEVICE_SYNC_ENABLED` | master switch; inert when off |
+| `sync_token` | empty | `DEVICE_SYNC_TOKEN` | shared bearer token; empty refuses every endpoint |
+| `peers_file` | empty (`~/.a0-device-sync/peers.json`) | `DEVICE_SYNC_PEERS_FILE` | manual peer list |
+| `peer_port` | `80` | `DEVICE_SYNC_PEER_PORT` | port peers are probed and served on |
+| `auto_sync_interval_s` | `0` | `DEVICE_SYNC_INTERVAL_S` | background loop cadence; 0 = off, 60 s floor |
+| `http_timeout_s` | `60` | `DEVICE_SYNC_TIMEOUT_S` | transfer timeout |
+| `memory_backend` | `none` | `DEVICE_SYNC_MEMORY_BACKEND` | `none` or `git` |
+| `memory_dir` | empty | `DEVICE_SYNC_MEMORY_DIR` | git atom store path |
+
+Details:
 
 `default_config.yaml` shows every key; env overrides: `DEVICE_SYNC_ENABLED`,
 `DEVICE_SYNC_TOKEN`, `DEVICE_SYNC_PEERS_FILE`, `DEVICE_SYNC_PEER_PORT`,
@@ -114,6 +152,10 @@ your plugin's earlier-numbered `startup_migration` extension).
   memory yet", not an error. A contended manual/auto sync reports busy
   instead of queueing.
 
+## Not covered here
+
+Risks noted from reading the code, documented in [the landscape doc](docs/research/2026-10-10-landscape.md): one shared token for all peers with no rotation; default port 80 is plain HTTP (fine on a tailnet, not off it); imported chats and memory enter the agent's context, so treat every peer as fully trusted.
+
 ## Tests
 
 ```bash
@@ -133,6 +175,8 @@ No external services needed — the HTTP seam is stubbed in tests.
 
 ## Status / limits
 
+- Plugin has no web UI yet; there is no screenshot to show.
+
 - Peer detection is an HTTP identity probe (see above) — it proves "an a0
   with this plugin answers", not just "a port is open".
 - No pack encryption — the threat model is tailnet transport security plus
@@ -141,3 +185,11 @@ No external services needed — the HTTP seam is stubbed in tests.
 - Chat dedupe preserves the *origin* ctxid — which means a chat synced
   A→B→A is recognized as the same chat (good), and two genuinely distinct
   local chats can never share a ctxid because a0 assigns ids.
+
+## Contributing
+
+Issues and PRs welcome. Run `python -m pytest tests/ -q` first (no network, tailscale or git needed). Read [AGENTS.md](AGENTS.md) for the conventions; do not rename the `khan-*` pack tags.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
